@@ -1,0 +1,58 @@
+# AnalysisTemplate — Prometheus-based canary promotion gate.
+#
+# During canary rollout, Argo Rollouts queries Prometheus for:
+#   1. HTTP success rate (non-5xx responses / total requests)
+#   2. p99 request latency
+#
+# If either metric falls below threshold, the canary is automatically aborted
+# and traffic reverts 100% to the stable version. This is the automated
+# quality gate that makes progressive delivery meaningful.
+#
+# The queries below intentionally carry no namespace label matcher — this
+# base is shared by both the staging and prod overlays, and Prometheus
+# Operator auto-injects a `namespace` label per PodMonitor-scraped series.
+# Each overlay's kustomization.yaml patches a `namespace="<env>"` matcher
+# into both queries; without it, staging and prod traffic would be averaged
+# together and a bad canary in one environment could pass analysis in the
+# other.
+
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: success-rate
+spec:
+  args:
+    - name: service-name
+  metrics:
+    - name: http-success-rate
+      interval: 60s
+      count: 5
+      successCondition: result[0] >= 0.95  # ≥ 95% non-5xx responses
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://prometheus-stack-kube-prom-prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            sum(rate(platform_status_http_requests_total{
+              status_code!~"5..",
+              endpoint!="/metrics"
+            }[2m])) /
+            sum(rate(platform_status_http_requests_total{
+              endpoint!="/metrics"
+            }[2m]))
+
+    - name: http-latency-p99
+      interval: 60s
+      count: 5
+      # p99 latency must be under 500ms
+      successCondition: result[0] < 0.5
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://prometheus-stack-kube-prom-prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            histogram_quantile(0.99,
+              sum(rate(platform_status_http_request_duration_seconds_bucket{
+                endpoint!="/metrics"
+              }[2m])) by (le)
+            )

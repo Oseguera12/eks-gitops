@@ -1,0 +1,18 @@
+# Instantiates the K8sBlockPrivileged template (policies/gatekeeper/templates/block-privileged.yaml),
+# which previously had no Constraint bound to it and was therefore inert.
+# Needed so the "privileged container" TTP is blocked at admission — the same
+# TTP family the Falco "Drill - Sensitive Host Path Mounted" rule catches at
+# runtime (kubernetes/platform/falco.yaml). See policies/gatekeeper/fixtures/.
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sBlockPrivileged
+metadata:
+  name: block-privileged-containers
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    namespaces:
+      - platform-status
+      - platform-status-staging

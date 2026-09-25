@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Oseguera12/runtime-metrics/schema/v1/runtime-metrics.schema.json",
+  "title": "Cloud Runtime Metrics Bundle",
+  "description": "Shared schema for metrics/runtime-metrics.json, emitted by eks-gitops, aks-pipeline, platform-engineering-lab, and cowrie-honeypot. One bundle per demo/drill window. See docs/runtime-metrics-contract.md (or README) in each repo for field-by-field usage.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "project",
+    "collected_at",
+    "window_start",
+    "window_end",
+    "deploy",
+    "identity",
+    "gates",
+    "admission",
+    "runtime",
+    "delivery",
+    "cost"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1"
+    },
+    "project": {
+      "type": "string",
+      "enum": ["eks-gitops", "aks-pipeline", "platform-engineering-lab", "cowrie-honeypot"]
+    },
+    "collected_at": { "type": "string", "format": "date-time" },
+    "window_start": { "type": "string", "format": "date-time" },
+    "window_end": { "type": "string", "format": "date-time" },
+    "deploy": {
+      "type": "object",
+      "required": ["duration_seconds", "destroy_confirmed"],
+      "additionalProperties": false,
+      "properties": {
+        "duration_seconds": { "type": ["number", "null"], "minimum": 0 },
+        "rebuild_duration_seconds": { "type": ["number", "null"], "minimum": 0 },
+        "destroy_confirmed": { "type": "boolean" },
+        "cluster_stopped": { "type": "boolean" }
+      }
+    },
+    "identity": {
+      "type": "object",
+      "required": ["oidc_auth_success", "long_lived_cloud_keys_in_ci"],
+      "additionalProperties": false,
+      "properties": {
+        "oidc_auth_success": { "type": "boolean" },
+        "long_lived_cloud_keys_in_ci": {
+          "type": "boolean",
+          "description": "Should be false wherever workload-identity federation is available (eks-gitops uses GitHub OIDC, aks-pipeline uses GitLab OIDC). Proxmox and DigitalOcean have no equivalent federation, so platform-engineering-lab and cowrie-honeypot may honestly report true — the field exists so that's visible in the bundle, not to force it false everywhere."
+        }
+      }
+    },
+    "gates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "status", "duration_ms"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "status": { "type": "string", "enum": ["pass", "fail", "skipped"] },
+          "duration_ms": { "type": "number", "minimum": 0 }
+        }
+      }
+    },
+    "admission": {
+      "type": "object",
+      "required": ["policies_evaluated", "violations_blocked", "fixture_failures"],
+      "additionalProperties": false,
+      "properties": {
+        "policies_evaluated": { "type": "integer", "minimum": 0 },
+        "violations_blocked": { "type": "integer", "minimum": 0 },
+        "fixture_failures": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "required": ["sensor", "alerts", "drills_run"],
+      "additionalProperties": false,
+      "properties": {
+        "sensor": { "type": "string", "enum": ["falco", "defender", "none"] },
+        "alerts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["rule", "priority", "detected_at"],
+            "additionalProperties": false,
+            "properties": {
+              "rule": { "type": "string", "minLength": 1 },
+              "priority": { "type": "string" },
+              "detected_at": { "type": "string", "format": "date-time" }
+            }
+          }
+        },
+        "mttd_seconds": { "type": ["number", "null"], "minimum": 0 },
+        "mttr_seconds": { "type": ["number", "null"], "minimum": 0 },
+        "drills_run": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "delivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "canary_promotions": { "type": "integer", "minimum": 0 },
+        "canary_rollbacks": { "type": "integer", "minimum": 0 },
+        "sync_failures": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "cost": {
+      "type": "object",
+      "required": ["usd_per_hour_estimate", "usd_window_total", "currency", "source"],
+      "additionalProperties": false,
+      "properties": {
+        "usd_per_hour_estimate": { "type": ["number", "null"], "minimum": 0 },
+        "usd_window_total": { "type": ["number", "null"], "minimum": 0 },
+        "currency": { "const": "USD" },
+        "source": { "type": "string", "enum": ["cost explorer", "azure cost", "do invoice", "n/a"] }
+      }
+    },
+    "attacker_telemetry": {
+      "type": "object",
+      "required": ["connections", "login_attempts", "successful_logins", "distinct_countries", "top_commands"],
+      "additionalProperties": false,
+      "properties": {
+        "connections": { "type": "integer", "minimum": 0 },
+        "login_attempts": { "type": "integer", "minimum": 0 },
+        "successful_logins": { "type": "integer", "minimum": 0 },
+        "distinct_countries": { "type": "integer", "minimum": 0 },
+        "top_commands": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  },
+  "if": {
+    "properties": { "project": { "const": "cowrie-honeypot" } }
+  },
+  "then": {
+    "required": ["attacker_telemetry"]
+  }
+}

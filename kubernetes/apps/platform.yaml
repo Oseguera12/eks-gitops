@@ -1,0 +1,29 @@
+# Platform Application — deploys all platform-layer components.
+# Managed by the root app-of-apps. Points at kubernetes/platform/
+# which contains Helm-based Application CRs for each tool.
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.io
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Oseguera12/eks-gitops.git
+    targetRevision: main
+    path: kubernetes/platform
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

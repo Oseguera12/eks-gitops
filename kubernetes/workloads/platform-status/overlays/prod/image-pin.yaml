@@ -1,0 +1,7 @@
+# The promotion gate. promote-to-prod.yml is the ONLY thing that ever
+# updates the `value` below — it copies whatever image is currently running
+# (and validated) in staging. Seeded to match base/rollout.yaml's default so
+# prod has a valid image the first time this overlay syncs.
+- op: replace
+  path: /spec/template/spec/containers/0/image
+  value: ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/platform-status:latest

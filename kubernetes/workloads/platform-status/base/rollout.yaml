@@ -1,0 +1,123 @@
+# Argo Rollouts Rollout — replaces the standard Deployment for platform-status.
+#
+# Strategy: canary
+#   - Route 20% of traffic to the new version for 5 minutes
+#   - Evaluate the AnalysisTemplate (success rate + latency)
+#   - Auto-promote if metrics pass; auto-abort and roll back if they fail
+#
+# This pattern is directly analogous to production canary workflows at
+# companies using Argo Rollouts at scale (e.g., Intuit, Adobe).
+#
+# Traffic is split via the Gateway API (kubernetes/platform/gateway-api-crds.yaml
+# + kubernetes/platform/nginx-gateway-fabric.yaml) through the Argo Rollouts
+# Gateway API plugin, not the legacy nginx-ingress annotations — ingress-nginx
+# was archived in March 2026 (no further releases or security fixes) with the
+# Gateway API as its Kubernetes SIG-Network-designated successor.
+
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: platform-status
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: platform-status
+  template:
+    metadata:
+      labels:
+        app: platform-status
+        # Prometheus scraping via PodMonitor
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: platform-status
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: platform-status
+          # Image tag is updated by the GitHub Actions workflow on every push to main.
+          # ArgoCD detects the change and triggers a canary rollout automatically.
+          image: ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/platform-status:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: ENVIRONMENT
+              value: "prod"
+            - name: CLUSTER_NAME
+              value: "eks-gitops"
+            - name: APP_VERSION
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['app.kubernetes.io/version']
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+  strategy:
+    canary:
+      # Maximum 3 replicas unavailable during rollout
+      maxUnavailable: 0
+      maxSurge: 1
+      steps:
+        - setWeight: 20   # 20% of traffic to canary
+        - pause:
+            duration: 5m  # Observe for 5 minutes
+        - analysis:
+            templates:
+              - templateName: success-rate
+            args:
+              - name: service-name
+                value: platform-status-canary
+        - setWeight: 50
+        - pause:
+            duration: 5m
+        - setWeight: 100
+      canaryService: platform-status-canary
+      stableService: platform-status-stable
+      trafficRouting:
+        plugins:
+          argoproj-labs/gatewayAPI:
+            httpRoute: platform-status
+            # HTTPRoute lives in this same namespace, alongside the stable/
+            # canary Services it targets (base/httproute.yaml) — not the
+            # Gateway's own namespace. Patched per-overlay along with
+            # ENVIRONMENT since Kustomize's namespace transformer only
+            # rewrites metadata.namespace fields, not opaque plugin config.
+            namespace: platform-status

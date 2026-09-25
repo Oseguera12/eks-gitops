@@ -1,0 +1,113 @@
+# kube-prometheus-stack — Prometheus, Grafana, and Alertmanager.
+# Configured to scrape all pods with a prometheus.io/scrape annotation,
+# plus ServiceMonitor and PodMonitor CRs for platform components.
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: prometheus-stack
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: kube-prometheus-stack
+    # Pinned to 88.1.5 (appVersion v0.93.0) instead of a floating "65.*" — that
+    # range was over 20 chart releases stale. This chart ships its own CRDs
+    # (PrometheusRule, ServiceMonitor, PodMonitor, etc.); on a jump this large,
+    # apply the CRDs directory first and confirm `kubectl get crd` shows the
+    # new versions before letting ArgoCD sync the release, or the sync can
+    # stall on an admission error for in-flight CRs. Not an issue for a fresh
+    # cluster bootstrap, only for upgrading an existing one.
+    targetRevision: "88.1.5"
+    helm:
+      releaseName: prometheus-stack
+      values: |
+        # Grafana
+        grafana:
+          enabled: true
+          replicas: 1
+          adminPassword: ""   # Set via ExternalSecret — see kubernetes/workloads/grafana-secret.yaml
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          dashboardProviders:
+            dashboardproviders.yaml:
+              apiVersion: 1
+              providers:
+                - name: default
+                  orgId: 1
+                  folder: ""
+                  type: file
+                  disableDeletion: false
+                  options:
+                    path: /var/lib/grafana/dashboards/default
+          sidecar:
+            dashboards:
+              enabled: true
+              label: grafana_dashboard
+
+        # Prometheus
+        prometheus:
+          prometheusSpec:
+            replicas: 1
+            retention: 7d
+            # Scrape all ServiceMonitors and PodMonitors across all namespaces
+            serviceMonitorSelectorNilUsesHelmValues: false
+            podMonitorSelectorNilUsesHelmValues: false
+            ruleSelectorNilUsesHelmValues: false
+            resources:
+              requests:
+                cpu: 200m
+                memory: 512Mi
+              limits:
+                memory: 1Gi
+            storageSpec:
+              volumeClaimTemplate:
+                spec:
+                  storageClassName: gp2
+                  resources:
+                    requests:
+                      storage: 10Gi
+
+        # Alertmanager
+        alertmanager:
+          alertmanagerSpec:
+            replicas: 1
+            resources:
+              requests:
+                cpu: 50m
+                memory: 64Mi
+              limits:
+                memory: 128Mi
+
+        # Node exporter — runs on every node
+        nodeExporter:
+          enabled: true
+
+        # kube-state-metrics
+        kubeStateMetrics:
+          enabled: true
+
+        # Disable components managed by EKS control plane
+        kubeEtcd:
+          enabled: false
+        kubeScheduler:
+          enabled: false
+        kubeControllerManager:
+          enabled: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

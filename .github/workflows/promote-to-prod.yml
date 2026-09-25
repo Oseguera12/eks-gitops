@@ -1,0 +1,77 @@
+name: Promote Staging to Prod (Manual)
+
+# The only thing that ever moves an image into the `workloads` (prod)
+# Application. Copies whatever image is currently running in staging —
+# written by ci-cd.yml's deploy job into
+# kubernetes/workloads/platform-status/base/rollout.yaml on every push to
+# main — into kubernetes/workloads/platform-status/overlays/prod/image-pin.yaml,
+# the one file that overlay ever patches. Prod never tracks main directly;
+# it only ever moves when this workflow runs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type PROMOTE to confirm — deploys staging's current image to prod"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    name: Promote staging image to prod
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm == 'PROMOTE'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy staging's current image into the prod overlay patch
+        run: |
+          BASE_FILE="kubernetes/workloads/platform-status/base/rollout.yaml"
+          PROD_PATCH="kubernetes/workloads/platform-status/overlays/prod/image-pin.yaml"
+
+          IMAGE=$(grep -m1 '^\s*image:' "${BASE_FILE}" | sed 's/^\s*image:\s*//')
+          if [ -z "${IMAGE}" ]; then
+            echo "Could not read an image reference out of ${BASE_FILE}" >&2
+            exit 1
+          fi
+          echo "Promoting image: ${IMAGE}"
+
+          sed -i "s|^  value:.*|  value: ${IMAGE}|" "${PROD_PATCH}"
+          grep -q "value: ${IMAGE}" "${PROD_PATCH}" || {
+            echo "Patch substitution did not land in ${PROD_PATCH}" >&2
+            exit 1
+          }
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${PROD_PATCH}"
+          git commit -m "chore(promote): prod -> ${IMAGE##*[@:]}"
+          git push
+
+      - name: Sync prod via ArgoCD
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        run: |
+          curl -sSL -o argocd \
+            "https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64"
+          chmod +x argocd
+
+          ./argocd app sync workloads \
+            --server "${ARGOCD_SERVER}" \
+            --auth-token "${ARGOCD_AUTH_TOKEN}" \
+            --grpc-web \
+            --timeout 300
+
+          ./argocd app wait workloads \
+            --server "${ARGOCD_SERVER}" \
+            --auth-token "${ARGOCD_AUTH_TOKEN}" \
+            --grpc-web \
+            --health \
+            --timeout 300
+
+          echo "Promotion complete. Prod (workloads Application) is now running staging's image." \
+            >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,95 @@
+# Grafana dashboard ConfigMap — picked up by the Grafana sidecar configured in
+# kubernetes/platform/prometheus-stack.yaml (sidecar.dashboards.label: grafana_dashboard).
+# Shows the runtime-vs-admission story this project demos: Falco detections next
+# to Gatekeeper denies for the same drill window.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-runtime-security
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  runtime-security.json: |
+    {
+      "title": "Runtime Security — Falco + Gatekeeper",
+      "uid": "runtime-security",
+      "schemaVersion": 39,
+      "version": 1,
+      "timezone": "utc",
+      "time": { "from": "now-6h", "to": "now" },
+      "refresh": "30s",
+      "panels": [
+        {
+          "id": 1,
+          "title": "Falco alerts / min, by priority",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "targets": [
+            {
+              "expr": "sum(rate(falco_events_total[1m])) by (priority) * 60",
+              "legendFormat": "{{priority}}"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "title": "Gatekeeper denies / min",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "targets": [
+            {
+              "expr": "sum(rate(gatekeeper_violations_total{enforcement_action=\"deny\"}[1m])) by (kind) * 60",
+              "legendFormat": "{{kind}}"
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "title": "Falco alerts, last 6h (by rule)",
+          "type": "table",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "targets": [
+            {
+              "expr": "sum(increase(falco_events_total[6h])) by (rule)",
+              "format": "table",
+              "instant": true
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "title": "Gatekeeper webhook up",
+          "type": "stat",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "targets": [
+            {
+              "expr": "max(up{job=~\".*gatekeeper.*\"})"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "mappings": [
+                { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" } } },
+                { "type": "value", "options": { "1": { "text": "UP", "color": "green" } } }
+              ]
+            }
+          }
+        }
+      ],
+      "templating": {
+        "list": [
+          {
+            "name": "DS_PROMETHEUS",
+            "type": "datasource",
+            "query": "prometheus",
+            "current": {}
+          }
+        ]
+      }
+    }

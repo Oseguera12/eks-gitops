@@ -1,0 +1,45 @@
+# Cluster Autoscaler — scales EKS node group based on pending pod pressure.
+# Service account is annotated with the IRSA role ARN.
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cluster-autoscaler
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  source:
+    repoURL: https://kubernetes.github.io/autoscaler
+    chart: cluster-autoscaler
+    targetRevision: "9.43.*"
+    helm:
+      releaseName: cluster-autoscaler
+      values: |
+        autoDiscovery:
+          clusterName: eks-gitops  # Must match var.cluster_name
+        awsRegion: us-east-1
+        rbac:
+          serviceAccount:
+            annotations:
+              # Replace with Terraform output: cluster_autoscaler_role_arn
+              eks.amazonaws.com/role-arn: "REPLACE_WITH_TERRAFORM_OUTPUT_cluster_autoscaler_role_arn"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            memory: 256Mi
+        extraArgs:
+          skip-nodes-with-local-storage: "false"
+          expander: least-waste
+          scale-down-utilization-threshold: "0.5"
+          scale-down-delay-after-add: 10m
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

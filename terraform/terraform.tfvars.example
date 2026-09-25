@@ -1,0 +1,32 @@
+# Copy this file to terraform.tfvars and fill in your values.
+# terraform.tfvars is gitignored — never commit it.
+
+aws_region   = "us-east-1"
+cluster_name = "eks-gitops"
+environment  = "prod"
+
+# Kubernetes version — check for latest EKS-supported version before deploying
+cluster_version = "1.32"
+
+# VPC — defaults work for most cases; adjust only if CIDR conflicts exist
+vpc_cidr             = "10.0.0.0/16"
+availability_zones   = ["us-east-1a", "us-east-1b", "us-east-1c"]
+public_subnet_cidrs  = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+private_subnet_cidrs = ["10.0.10.0/24", "10.0.11.0/24", "10.0.12.0/24"]
+
+# Node group — t3.medium is 2 vCPU / 4 GB RAM, sized for the full platform
+# stack. t3.micro is Free Tier eligible but too small to schedule everything
+# (ArgoCD + Prometheus stack + Gatekeeper + Falco combined exceed ~2.5-3 GB).
+# Minimum 1 node prevents full scale-to-zero while keeping Cluster Autoscaler active
+node_instance_type = "t3.medium"
+node_min_size      = 1
+node_desired_size  = 2
+node_max_size      = 3
+
+# ECR
+ecr_repository_name    = "platform-status"
+ecr_image_retention_count = 10
+
+# GitHub OIDC — must match the repository that runs GitHub Actions
+github_repo_owner = "Oseguera12"
+github_repo_name  = "eks-gitops"

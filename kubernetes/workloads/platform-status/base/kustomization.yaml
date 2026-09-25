@@ -1,0 +1,14 @@
+# Base — environment-agnostic platform-status manifests. Never applied
+# directly; overlays/staging and overlays/prod each set their own namespace
+# and patch the handful of fields that differ per environment.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - rollout.yaml
+  - services.yaml
+  - podmonitor.yaml
+  - analysis-template.yaml
+  - httproute.yaml

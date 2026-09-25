@@ -1,0 +1,26 @@
+# Stable service — routes to the previous (stable) ReplicaSet during canary.
+apiVersion: v1
+kind: Service
+metadata:
+  name: platform-status-stable
+spec:
+  selector:
+    app: platform-status
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+
+---
+# Canary service — routes to the new (canary) ReplicaSet during rollout.
+apiVersion: v1
+kind: Service
+metadata:
+  name: platform-status-canary
+spec:
+  selector:
+    app: platform-status
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

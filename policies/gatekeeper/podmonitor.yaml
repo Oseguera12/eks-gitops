@@ -1,0 +1,30 @@
+# Gatekeeper does not put its :8888/metrics port behind a Service, so a
+# ServiceMonitor can't target it — Prometheus has to scrape the pods directly.
+# See https://open-policy-agent.github.io/gatekeeper/website/docs/metrics/
+# and https://github.com/open-policy-agent/gatekeeper/issues/659 (no built-in
+# ServiceMonitor support in the chart as of this writing).
+# `gatekeeper.sh/system: "yes"` is set on both the controller-manager and the
+# audit pod, so this one PodMonitor covers both admission and audit metrics
+# (gatekeeper_violations_total powers the GatekeeperDenyRateHigh alert in
+# kubernetes/workloads/runtime-security/runtime-prometheusrule.yaml).
+
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: gatekeeper
+  namespace: gatekeeper-system
+  labels:
+    release: prometheus-stack
+spec:
+  namespaceSelector:
+    matchNames:
+      - gatekeeper-system
+  selector:
+    matchLabels:
+      gatekeeper.sh/system: "yes"
+  podMetricsEndpoints:
+    # Numeric targetPort (not a named `port`) — the container port on the
+    # Gatekeeper pod isn't guaranteed to be named "metrics" across chart versions.
+    - targetPort: 8888
+      path: /metrics
+      interval: 30s

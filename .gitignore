@@ -1,0 +1,94 @@
+# ─── Terraform ────────────────────────────────────────────────────────────────
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+*.tfplan
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# tfvars contain secrets — only commit .example files
+*.tfvars
+!*.tfvars.example
+
+# ─── Environment / Secrets ────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+kubeconfig
+kubeconfig.*
+
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+dist/
+build/
+*.egg-info/
+.eggs/
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ─── Docker ───────────────────────────────────────────────────────────────────
+.dockerignore.local
+
+# ─── IDE / Editor ─────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ─── AWS ──────────────────────────────────────────────────────────────────────
+.aws/credentials
+aws-exports.js
+
+# ─── Helm ─────────────────────────────────────────────────────────────────────
+charts/*.tgz
+
+# ─── Cosign ───────────────────────────────────────────────────────────────────
+cosign.key
+cosign.pub
+
+# ─── SBOM / scan artifacts ────────────────────────────────────────────────────
+sbom.json
+sbom.spdx
+*.sarif
+trivy-results.json
+
+# ─── Runtime metrics (generated locally by demo drills) ───────────────────────
+# CI is the system of record — it uploads this as a pipeline artifact, it
+# doesn't need to be committed. Local drill runs shouldn't leave it dirty.
+metrics/runtime-metrics.json
+
+# ─── Local verification evidence (scripts/verify.sh) ──────────────────────────
+# Personal record for interview/resume prep — not meant for the repo.
+verify-results/
+
+# macOS AppleDouble / metadata artifacts (created on exFAT/network volumes)
+._*
+.DS_Store
+.Spotlight-V100/
+.Trashes/
+.TemporaryItems/
+.fseventsd/
+.apdisk

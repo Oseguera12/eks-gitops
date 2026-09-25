@@ -1,0 +1,190 @@
+name: Verify + Runtime Metrics — Health Check + Falco Drill + Gatekeeper Fixtures + Chaos Drill (Manual)
+
+# Manual, cluster-must-already-be-up workflow — the single place to check
+# both "does everything actually work" and "what are the metrics", so you
+# never have to run scripts/verify.sh locally to get an answer:
+#   1. Run scripts/verify.sh (nodes, pods, ArgoCD app health, app health
+#      endpoints, Rollout status, Gatekeeper enforcement, Prometheus scrape
+#      target) — results posted to this run's Job Summary
+#   2. Run the Gatekeeper admission fixtures (policies/gatekeeper/fixtures/)
+#   3. Run the Falco runtime drill (scripts/runtime-drill.sh)
+#   4. Run the chaos drill (scripts/chaos-drill.sh) — pod-kill always,
+#      node-drain only if run_node_drain is true (slow: new EC2 instance +
+#      kubelet join)
+#   5. Merge all four, plus this run's CI gate results and a manual cost
+#      snapshot, into metrics/runtime-metrics.json (scripts/emit-runtime-metrics.py)
+#   6. Upload the verify log, chaos log, and metrics bundle as pipeline
+#      artifacts — the system of record for MTTD/MTTR, not a number typed
+#      into a slide.
+#
+# Does NOT provision or destroy the cluster. Run deploy.yml first, run this,
+# then run the "Infrastructure — Terraform Destroy" workflow before end of
+# day — see the Demo Session Runbook. destroy.yml patches
+# deploy.destroy_confirmed onto the bundle this workflow produces.
+
+on:
+  workflow_dispatch:
+    inputs:
+      window_start:
+        description: "Demo window start, ISO-8601 UTC (e.g. 2026-08-05T18:00:00Z)"
+        required: true
+        type: string
+      cost_per_hour:
+        description: "Observed/estimated USD per hour for this window (see README cost table)"
+        required: false
+        type: string
+        default: "1.5"
+      cost_source:
+        description: "Where the cost number came from"
+        required: false
+        type: choice
+        options: ["cost explorer", "n/a"]
+        default: "n/a"
+      run_node_drain:
+        description: "Also run the node-drain chaos experiment (slow: new EC2 instance + kubelet join)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+  actions: read  # gh run download, to fetch the latest CI gate durations
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: eks-gitops
+
+jobs:
+  runtime-metrics:
+    name: Falco Drill + Gatekeeper Fixtures + Emit Metrics
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC — no long-lived keys)
+        id: aws-auth
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-RuntimeMetrics-${{ github.run_id }}
+
+      - name: Point kubectl at the cluster
+        run: aws eks update-kubeconfig --region "${AWS_REGION}" --name "${CLUSTER_NAME}"
+
+      - name: Run live verification checklist
+        id: verify
+        run: scripts/verify.sh
+        continue-on-error: true # capture the result either way, same as the fixtures/drill below
+
+      - name: Post verification results to job summary
+        if: always()
+        run: |
+          echo "## Live verification (scripts/verify.sh)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat verify-results/verify-*.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no verify log produced" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run Gatekeeper admission fixtures
+        id: fixtures
+        run: policies/gatekeeper/fixtures/run-fixtures.sh /tmp/gatekeeper-fixtures.json
+        continue-on-error: true  # capture the result either way — a failed fixture is itself signal
+
+      - name: Run Falco runtime drill
+        id: drill
+        run: scripts/runtime-drill.sh /tmp/runtime-drill.json
+        continue-on-error: true
+
+      - name: Run chaos drill
+        id: chaos
+        env:
+          RUN_NODE_DRAIN: ${{ inputs.run_node_drain && '1' || '0' }}
+        run: scripts/chaos-drill.sh /tmp/chaos-drill.json
+        continue-on-error: true
+
+      - name: Post chaos drill results to job summary
+        if: always()
+        run: |
+          echo "## Chaos drill" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/chaos-drill.json >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no chaos-drill output produced" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # Best-effort: pull the CI security-gate durations from the most recent
+      # ci-cd.yml run so the same bundle also answers "how long did the
+      # security gates take", not just the runtime/admission questions.
+      # Missing is fine — emit-runtime-metrics.py treats an absent file as
+      # "no extra gates" rather than failing the run.
+      - name: Fetch latest CI gate durations
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RUN_ID=$(gh run list --workflow=ci-cd.yml --status=completed \
+            --limit 1 --json databaseId --jq '.[0].databaseId' || true)
+          if [ -n "${RUN_ID}" ]; then
+            gh run download "${RUN_ID}" -n pipeline-gates -D /tmp/pipeline-gates || \
+              echo "pipeline-gates artifact unavailable for run ${RUN_ID} — continuing without it"
+          fi
+
+      - name: Emit metrics/runtime-metrics.json
+        run: |
+          # Chaos recovery times have no dedicated schema field (unlike
+          # runtime/admission), so they ride in the gate's duration_ms —
+          # real seconds, not just pass/fail, without touching the schema
+          # shared across all 4 portfolio projects.
+          pod_kill_ms=$(jq '((.experiments[] | select(.name=="pod-kill") | .recovery_seconds) // 0) * 1000' /tmp/chaos-drill.json 2>/dev/null || echo 0)
+          gate_args=(
+            --gate "live-verify:$( [ '${{ steps.verify.outcome }}' = success ] && echo pass || echo fail ):0"
+            --gate "gatekeeper-fixtures:$( [ '${{ steps.fixtures.outcome }}' = success ] && echo pass || echo fail ):0"
+            --gate "falco-drill:$( [ '${{ steps.drill.outcome }}' = success ] && echo pass || echo fail ):0"
+            --gate "chaos-pod-kill:$( [ '${{ steps.chaos.outcome }}' = success ] && echo pass || echo fail ):${pod_kill_ms}"
+          )
+          if [ "${{ inputs.run_node_drain }}" = "true" ]; then
+            node_drain_ms=$(jq '((.experiments[] | select(.name=="node-drain") | .recovery_seconds) // 0) * 1000' /tmp/chaos-drill.json 2>/dev/null || echo 0)
+            gate_args+=(--gate "chaos-node-drain:$( [ '${{ steps.chaos.outcome }}' = success ] && echo pass || echo fail ):${node_drain_ms}")
+          fi
+
+          python3 scripts/emit-runtime-metrics.py \
+            --project eks-gitops \
+            --window-start "${{ inputs.window_start }}" \
+            --window-end "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "${gate_args[@]}" \
+            --gates-json /tmp/pipeline-gates/gates.json \
+            --admission-json /tmp/gatekeeper-fixtures.json \
+            --runtime-json /tmp/runtime-drill.json \
+            --oidc-success \
+            --cost-per-hour "${{ inputs.cost_per_hour }}" \
+            --cost-source "${{ inputs.cost_source }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-metrics
+          path: metrics/runtime-metrics.json
+          retention-days: 90
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verify-log
+          path: verify-results/
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chaos-drill
+          path: /tmp/chaos-drill.json
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Fail the job if any check failed
+        if: steps.verify.outcome != 'success' || steps.fixtures.outcome != 'success' || steps.drill.outcome != 'success' || steps.chaos.outcome != 'success'
+        run: |
+          echo "Live verify:          ${{ steps.verify.outcome }}"
+          echo "Gatekeeper fixtures:  ${{ steps.fixtures.outcome }}"
+          echo "Falco drill:          ${{ steps.drill.outcome }}"
+          echo "Chaos drill:          ${{ steps.chaos.outcome }}"
+          echo "metrics/runtime-metrics.json was still written and uploaded — check the artifact and Job Summary for detail."
+          exit 1

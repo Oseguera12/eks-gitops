@@ -1,0 +1,13 @@
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequireNonRoot
+metadata:
+  name: require-non-root-containers
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    namespaces:
+      - platform-status
+      - platform-status-staging

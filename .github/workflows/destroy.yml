@@ -1,0 +1,95 @@
+name: Infrastructure — Terraform Destroy (Manual)
+
+# Manual workflow to tear down all AWS resources.
+# ALWAYS run `terraform destroy` after demos to stop incurring charges.
+# EKS + NAT Gateway costs ~$6–8/day while running.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type DESTROY to confirm full teardown"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  actions: read  # gh run download, to fetch today's runtime-metrics artifact
+
+jobs:
+  destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm == 'DESTROY'
+    defaults:
+      run:
+        working-directory: terraform/
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_STATE_DYNAMODB_TABLE }}" \
+            -backend-config="region=us-east-1"
+
+      # No -var-file here: terraform.tfvars is gitignored and never exists on a
+      # CI runner. variables.tf defaults mirror terraform.tfvars.example, so
+      # the defaults ARE the intended CI config.
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve
+
+      - name: Confirm teardown
+        run: echo "All resources destroyed. No ongoing charges."
+
+      # Cost hard rule: every cloud session ends with destroy_confirmed written
+      # into metrics/runtime-metrics.json — see the "Runtime Metrics" workflow,
+      # which produces the bundle this step patches. If that workflow never ran
+      # today there's nothing to patch; that's a gap in the record, not a
+      # failure of this teardown.
+      - name: Patch destroy_confirmed onto today's runtime-metrics bundle
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RUN_ID=$(gh run list --workflow=runtime-metrics.yml --status=completed \
+            --limit 1 --json databaseId --jq '.[0].databaseId' || true)
+          if [ -z "${RUN_ID}" ]; then
+            echo "No completed 'Runtime Metrics' run found — nothing to patch."
+            echo "Run that workflow during the demo window next time to keep the record complete."
+            exit 0
+          fi
+          mkdir -p /tmp/metrics-patch
+          if ! gh run download "${RUN_ID}" -n runtime-metrics -D /tmp/metrics-patch; then
+            echo "Could not download the runtime-metrics artifact (expired or run failed before upload) — skipping patch."
+            exit 0
+          fi
+          python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("/tmp/metrics-patch/runtime-metrics.json")
+          doc = json.loads(p.read_text())
+          doc["deploy"]["destroy_confirmed"] = True
+          p.write_text(json.dumps(doc, indent=2) + "\n")
+          PY
+          mkdir -p metrics
+          cp /tmp/metrics-patch/runtime-metrics.json metrics/runtime-metrics.json
+          cat metrics/runtime-metrics.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-metrics-final
+          path: metrics/runtime-metrics.json
+          retention-days: 90
+          if-no-files-found: ignore

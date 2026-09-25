@@ -1,0 +1,49 @@
+# Argo Rollouts — progressive delivery controller.
+# Enables canary and blue/green deployment strategies with automated
+# metric-based promotion and rollback via AnalysisTemplate CRs.
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: argo-rollouts
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  source:
+    repoURL: https://argoproj.github.io/argo-helm
+    chart: argo-rollouts
+    # Pinned to 2.41.1 (latest stable) instead of a floating "2.38.*".
+    targetRevision: "2.41.1"
+    helm:
+      releaseName: argo-rollouts
+      values: |
+        controller:
+          replicas: 1
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          metrics:
+            enabled: true
+            serviceMonitor:
+              enabled: true
+        dashboard:
+          enabled: true
+          replicas: 1
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argo-rollouts
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

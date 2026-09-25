@@ -1,0 +1,23 @@
+# Scopes both PromQL queries to this environment's namespace — see the
+# comment in base/analysis-template.yaml for why this matters.
+- op: replace
+  path: /spec/metrics/0/provider/prometheus/query
+  value: |
+    sum(rate(platform_status_http_requests_total{
+      namespace="platform-status-staging",
+      status_code!~"5..",
+      endpoint!="/metrics"
+    }[2m])) /
+    sum(rate(platform_status_http_requests_total{
+      namespace="platform-status-staging",
+      endpoint!="/metrics"
+    }[2m]))
+- op: replace
+  path: /spec/metrics/1/provider/prometheus/query
+  value: |
+    histogram_quantile(0.99,
+      sum(rate(platform_status_http_request_duration_seconds_bucket{
+        namespace="platform-status-staging",
+        endpoint!="/metrics"
+      }[2m])) by (le)
+    )

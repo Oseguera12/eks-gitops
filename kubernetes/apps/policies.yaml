@@ -1,0 +1,43 @@
+# Policies Application — deploys OPA Gatekeeper ConstraintTemplates and Constraints.
+#
+# Runs at sync-wave "2", after the Gatekeeper Helm release (wave "1") has
+# installed the gatekeeper.sh CRDs and the admission webhook is ready.
+# ConstraintTemplates register new CRDs; Constraints enforce them on
+# admission. Both are cluster-scoped resources.
+#
+# NOTE: The gatekeeper.yaml Application (wave "1") exempts kube-system,
+# argocd, gatekeeper-system, cert-manager, external-secrets, monitoring,
+# and argo-rollouts from policy enforcement to prevent bootstrap
+# circular-dependency issues. All other namespaces (including
+# platform-status) are subject to these policies.
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: policies
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.io
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Oseguera12/eks-gitops.git
+    targetRevision: main
+    path: policies/gatekeeper
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: gatekeeper-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false
+      # ConstraintTemplates and Constraints are cluster-scoped CRDs;
+      # server-side apply handles field ownership correctly.
+      - ServerSideApply=true
+      # Do not fail the sync if Gatekeeper CRDs are not yet registered;
+      # ArgoCD will retry until the CRDs are available.
+      - SkipDryRunOnMissingResource=true

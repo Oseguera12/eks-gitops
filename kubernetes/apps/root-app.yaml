@@ -1,0 +1,38 @@
+# Root Application — the top of the app-of-apps tree.
+#
+# This single Application CR is applied manually once after ArgoCD bootstrap.
+# It points ArgoCD at the kubernetes/apps/ directory, which contains
+# Application CRs for every other component. From that point forward,
+# all configuration changes flow through Git — no manual kubectl apply
+# commands are needed.
+#
+# Apply with:
+#   kubectl apply -n argocd -f kubernetes/apps/root-app.yaml
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  namespace: argocd
+  # Prevent ArgoCD from deleting this Application when pruning
+  finalizers:
+    - resources-finalizer.argocd.io
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Oseguera12/eks-gitops.git
+    targetRevision: main
+    path: kubernetes/apps
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+      - PruneLast=true

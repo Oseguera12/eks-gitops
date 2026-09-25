@@ -1,0 +1,26 @@
+# Prod — same namespace name (platform-status) this project has always used,
+# so nothing outside this directory (README commands, Gatekeeper constraints,
+# the `workloads` ArgoCD Application name) needs to change. The only thing
+# that ever updates image-pin.yaml is .github/workflows/promote-to-prod.yml —
+# never CI, never a human editing it by hand.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: platform-status
+
+resources:
+  - ../../base
+
+patches:
+  - target:
+      group: argoproj.io
+      version: v1alpha1
+      kind: Rollout
+      name: platform-status
+    path: image-pin.yaml
+  - target:
+      group: argoproj.io
+      version: v1alpha1
+      kind: AnalysisTemplate
+      name: success-rate
+    path: analysis-template-patch.yaml

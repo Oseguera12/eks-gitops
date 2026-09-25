@@ -1,0 +1,30 @@
+# Workloads Staging Application — always tracks the image ci-cd.yml's deploy
+# job just wrote into base/rollout.yaml. Every push to main lands here
+# automatically; nothing here is ever hand-promoted (that's `workloads`,
+# gated by .github/workflows/promote-to-prod.yml). Same sync-wave as
+# `workloads` — they're independent environments, not a dependency chain.
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: workloads-staging
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.io
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Oseguera12/eks-gitops.git
+    targetRevision: main
+    path: kubernetes/workloads/platform-status/overlays/staging
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: platform-status-staging
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

@@ -1,0 +1,29 @@
+# Staging — always tracks whatever image ci-cd.yml's deploy job just wrote
+# into base/rollout.yaml. Auto-synced by ArgoCD on every push to main
+# (kubernetes/apps/workloads-staging.yaml). This is the "does the new build
+# actually work" environment; nothing here is ever hand-promoted.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: platform-status-staging
+
+resources:
+  - ../../base
+
+# JSON6902 (not strategic-merge) throughout: Kustomize doesn't know the
+# OpenAPI schema for Argo Rollouts/AnalysisTemplate CRDs, so a partial
+# strategic-merge patch on a list field (env, steps) would replace the whole
+# list instead of merging into it. Explicit paths avoid that ambiguity.
+patches:
+  - target:
+      group: argoproj.io
+      version: v1alpha1
+      kind: Rollout
+      name: platform-status
+    path: rollout-patch.yaml
+  - target:
+      group: argoproj.io
+      version: v1alpha1
+      kind: AnalysisTemplate
+      name: success-rate
+    path: analysis-template-patch.yaml

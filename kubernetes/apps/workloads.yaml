@@ -1,0 +1,32 @@
+# Workloads Application — deploys platform-status to PROD only.
+# Depends on the platform layer being healthy first (sync-wave "2").
+#
+# Image only ever changes here via .github/workflows/promote-to-prod.yml
+# writing overlays/prod/image-pin.yaml — never via ci-cd.yml, which targets
+# workloads-staging.yaml instead. See the Demo Session Runbook /
+# Multi-Environment Promotion section in the README.
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: workloads
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.io
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Oseguera12/eks-gitops.git
+    targetRevision: main
+    path: kubernetes/workloads/platform-status/overlays/prod
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: platform-status
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

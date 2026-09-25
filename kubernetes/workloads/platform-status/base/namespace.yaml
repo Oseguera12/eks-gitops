@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: platform-status
+  labels:
+    # OPA Gatekeeper enforces policies on this namespace
+    admission.policy/enforce: "true"

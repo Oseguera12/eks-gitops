@@ -1,0 +1,34 @@
+# ConstraintTemplate — requires all containers to run as non-root.
+# Enforced by OPA Gatekeeper's admission webhook before any pod is scheduled.
+
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequirenonroot
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequireNonRoot
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequirenonroot
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          not container.securityContext.runAsNonRoot
+          msg := sprintf("Container '%v' must set securityContext.runAsNonRoot=true", [container.name])
+        }
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          container.securityContext.runAsUser == 0
+          msg := sprintf("Container '%v' must not run as root (runAsUser=0)", [container.name])
+        }
+
+        violation[{"msg": msg}] {
+          init := input.review.object.spec.initContainers[_]
+          not init.securityContext.runAsNonRoot
+          msg := sprintf("initContainer '%v' must set securityContext.runAsNonRoot=true", [init.name])
+        }

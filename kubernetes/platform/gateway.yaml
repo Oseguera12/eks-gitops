@@ -1,0 +1,25 @@
+# The shared Gateway — one listener, one NLB, reused by both the staging
+# and prod platform-status HTTPRoutes via cross-namespace parentRefs
+# (allowedRoutes.namespaces.from: All below). Sync-wave "3": needs the
+# GatewayClass nginx-gateway-fabric.yaml's chart creates (wave "2") to exist
+# first, or this sits unaccepted with no controller to reconcile it.
+#
+# This file is a plain resource, not another Application — it's applied
+# directly as one of the `platform` Application's own resources (destination
+# namespace argocd otherwise), so metadata.namespace must be explicit here.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: eks-gitops
+  namespace: nginx-gateway
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  gatewayClassName: nginx
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: All

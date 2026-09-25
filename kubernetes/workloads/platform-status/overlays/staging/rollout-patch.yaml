@@ -1,0 +1,17 @@
+# 1 replica (not 3) and shortened canary pauses (1m, not 5m) — staging exists
+# to catch problems fast, not to run a production-shaped observation window.
+- op: replace
+  path: /spec/replicas
+  value: 1
+- op: replace
+  path: /spec/template/spec/containers/0/env/0/value
+  value: staging
+- op: replace
+  path: /spec/strategy/canary/steps/1/pause/duration
+  value: 1m
+- op: replace
+  path: /spec/strategy/canary/steps/4/pause/duration
+  value: 1m
+- op: replace
+  path: /spec/strategy/canary/trafficRouting/plugins/argoproj-labs~1gatewayAPI/namespace
+  value: platform-status-staging

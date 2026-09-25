@@ -1,0 +1,31 @@
+# Gateway API CRDs (standard channel) — must exist before NGINX Gateway
+# Fabric (this file's sync-wave "1", one tier ahead of the wave-"2"
+# controller in nginx-gateway-fabric.yaml) or the Argo Rollouts Gateway API
+# plugin can do anything with Gateway/HTTPRoute resources.
+#
+# Sourced directly from the NGINX Gateway Fabric repo's pinned CRD bundle
+# (matches the chart version below) rather than upstream kubernetes-sigs/
+# gateway-api directly, since NGF documents that exact pairing as the
+# supported combination.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gateway-api-crds
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/nginx/nginx-gateway-fabric.git
+    targetRevision: v2.6.7
+    path: config/crd/gateway-api/standard
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true # CRDs regularly exceed the 256KB kubectl.kubernetes.io/last-applied-configuration annotation limit

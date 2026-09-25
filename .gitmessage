@@ -1,0 +1,12 @@
+# <type>(<scope>): <short summary, imperative present tense, <=72 chars>
+#
+# Body (optional) - explain WHY this change was made, not what the diff
+# already shows. Wrap at ~72 chars.
+#
+# Types: feat, fix, docs, chore, refactor, test, ci, perf
+# Scope: module or component touched, e.g. terraform, ci, kubernetes, app
+#
+# Rules:
+#   - No AI tool attribution, assistant names, or "Generated with" lines.
+#   - No Co-authored-by trailers unless a real second human contributed.
+#   - Reference an issue/ticket with "Refs #123" if one exists.

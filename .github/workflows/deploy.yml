@@ -1,0 +1,145 @@
+name: Deploy — Full Stack (Manual)
+
+# One-click path for a demo session: terraform apply (recreate infra) +
+# ArgoCD bootstrap (helm install + root app-of-apps) + wait for every
+# Application to reach Synced/Healthy.
+#
+# Assumes the ONE-TIME setup in the README (bootstrap/setup.sh, first
+# terraform apply, GitHub secrets, manifest ARN substitution + commit) has
+# already happened. IAM role names/ARNs are deterministic (cluster_name +
+# fixed suffixes), so they survive a destroy → this workflow cycle unchanged
+# — no re-substitution needed.
+#
+# Does NOT refresh ARGOCD_SERVER / ARGOCD_AUTH_TOKEN. Those point at the
+# ArgoCD instance's admin account and LoadBalancer hostname, both of which
+# are recreated from scratch here. If you want ci-cd.yml's `argocd app sync`
+# deploy stage to work this session (i.e. you're pushing new app code, not
+# just checking the platform comes up clean), regenerate and update those
+# two secrets using the values this workflow prints in its summary.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type DEPLOY to confirm (provisions billable AWS resources)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: eks-gitops
+  TF_VERSION: "1.15.7"
+  ARGOCD_CHART_VERSION: "7.8.28"
+
+jobs:
+  deploy:
+    name: Terraform Apply + ArgoCD Bootstrap
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm == 'DEPLOY'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-Deploy-${{ github.run_id }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init + Apply
+        working-directory: terraform/
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_STATE_DYNAMODB_TABLE }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+          # No -var-file: terraform.tfvars is gitignored and never exists on a
+          # CI runner. variables.tf defaults mirror terraform.tfvars.example.
+          terraform apply -auto-approve
+
+      - name: Point kubectl at the cluster
+        run: aws eks update-kubeconfig --region "${AWS_REGION}" --name "${CLUSTER_NAME}"
+
+      - name: Wait for nodes to be Ready
+        run: kubectl wait --for=condition=Ready nodes --all --timeout=5m
+
+      - name: Install ArgoCD
+        run: |
+          helm repo add argo https://argoproj.github.io/argo-helm
+          helm repo update
+          helm upgrade --install argocd argo/argo-cd \
+            --namespace argocd \
+            --create-namespace \
+            --values kubernetes/bootstrap/argocd/values.yaml \
+            --version "${ARGOCD_CHART_VERSION}" \
+            --wait --timeout 5m
+
+      - name: Apply root app-of-apps
+        run: kubectl apply -f kubernetes/apps/root-app.yaml
+
+      - name: Wait for all ArgoCD Applications to be Synced + Healthy
+        run: |
+          echo "Waiting up to 10 minutes for platform, policies, and workloads to settle..."
+          deadline=$((SECONDS + 600))
+          while [ "${SECONDS}" -lt "${deadline}" ]; do
+            apps_json=$(kubectl get applications -n argocd -o json)
+            total=$(echo "${apps_json}" | jq '.items | length')
+            ready=$(echo "${apps_json}" | jq '[.items[] | select(.status.sync.status=="Synced" and .status.health.status=="Healthy")] | length')
+            echo "  ${ready}/${total} Applications Synced+Healthy"
+            if [ "${total}" -gt 0 ] && [ "${ready}" -eq "${total}" ]; then
+              echo "All Applications healthy."
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "Timed out waiting for Applications to become healthy — dumping status:"
+          kubectl get applications -n argocd
+          exit 1
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo "## Deploy summary" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          kubectl get nodes -o wide >> "$GITHUB_STEP_SUMMARY" || true
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          kubectl get applications -n argocd >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+          ARGOCD_PW=$(kubectl -n argocd get secret argocd-initial-admin-secret \
+            -o jsonpath="{.data.password}" 2>/dev/null | base64 -d || echo "<unavailable>")
+          ARGOCD_LB=$(kubectl get svc argocd-server -n argocd \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "<pending — LB DNS can take a couple minutes>")
+          # NGINX Gateway Fabric names the per-Gateway LB service <gateway-name>-nginx.
+          GATEWAY_LB=$(kubectl get svc eks-gitops-nginx -n nginx-gateway \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "<pending — LB DNS can take a couple minutes>")
+
+          {
+            echo ""
+            echo "### ArgoCD access (fresh this session — LB and admin account are new)"
+            echo "- Server: \`${ARGOCD_LB}\`"
+            echo "- Username: \`admin\`"
+            echo "- Password: \`${ARGOCD_PW}\`"
+            echo ""
+            echo "If you plan to push app code and want ci-cd.yml's deploy stage to work,"
+            echo "update the \`ARGOCD_SERVER\` and \`ARGOCD_AUTH_TOKEN\` repo secrets with"
+            echo "these values (generate the token with \`argocd account generate-token\`)."
+            echo ""
+            echo "### Gateway (for canary traffic during a rollout demo)"
+            echo "- Hostname: \`${GATEWAY_LB}\`"
+            echo "- \`scripts/generate-canary-traffic.sh ${GATEWAY_LB}\` right after triggering"
+            echo "  a rollout gives the AnalysisTemplate's rate() queries real data to evaluate."
+            echo ""
+            echo "**Reminder:** this cluster now costs ~\$0.26/hr. Run \`scripts/verify.sh\`"
+            echo "to confirm everything's healthy, then either the manual"
+            echo "\"Infrastructure — Terraform Destroy\" workflow or wait for the"
+            echo "5-hour auto-destroy watchdog."
+          } >> "$GITHUB_STEP_SUMMARY"

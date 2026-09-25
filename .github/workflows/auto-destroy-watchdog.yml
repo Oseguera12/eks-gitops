@@ -1,0 +1,74 @@
+name: Infrastructure — Auto-Destroy Watchdog
+
+# Safety net, not the primary teardown path. Polls the EKS cluster's
+# creation timestamp every 15 minutes; once it's been up ~5 hours, triggers
+# the same "Infrastructure — Terraform Destroy" workflow you'd run by hand.
+# Exists purely for "I forgot to tear it down" — always prefer destroying
+# manually as soon as you're done with a demo session.
+#
+# Works regardless of how the cluster was created (deploy.yml, terraform.yml,
+# or a local `terraform apply`) since it only reads EKS's own createdAt
+# field — no separate timer/state to keep in sync.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {} # manual run, e.g. to sanity-check the age calculation
+
+permissions:
+  contents: read
+  id-token: write
+  actions: write # to trigger destroy.yml
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: eks-gitops
+  MAX_AGE_HOURS: 5
+
+jobs:
+  check-and-destroy:
+    name: Check cluster age
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        id: aws-auth
+        continue-on-error: true # role may not exist yet on a from-scratch repo — treat as "no cluster"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-AutoDestroyWatchdog-${{ github.run_id }}
+
+      - name: Check cluster existence and age
+        id: check
+        if: steps.aws-auth.outcome == 'success'
+        run: |
+          created_at=$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" \
+            --query 'cluster.createdAt' --output text 2>/dev/null || true)
+
+          if [ -z "${created_at}" ] || [ "${created_at}" == "None" ]; then
+            echo "No cluster named ${CLUSTER_NAME} found — nothing to do."
+            echo "should_destroy=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          created_epoch=$(date -d "${created_at}" +%s)
+          now_epoch=$(date -u +%s)
+          age_hours=$(( (now_epoch - created_epoch) / 3600 ))
+          echo "Cluster created at ${created_at} — age: ${age_hours}h (limit: ${MAX_AGE_HOURS}h)"
+
+          if [ "${age_hours}" -ge "${MAX_AGE_HOURS}" ]; then
+            echo "should_destroy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_destroy=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trigger Terraform Destroy
+        if: steps.check.outputs.should_destroy == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Cluster exceeded ${MAX_AGE_HOURS}h — triggering auto-destroy."
+          gh workflow run destroy.yml -f confirm=DESTROY --repo "${GITHUB_REPOSITORY}"

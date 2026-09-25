@@ -1,0 +1,67 @@
+# PrometheusRule — alerts on the two runtime-vs-admission signals this project
+# demos: Falco detections firing, and Gatekeeper actively blocking at admission.
+# prometheus-stack.yaml sets ruleSelectorNilUsesHelmValues=false, so Prometheus
+# picks up PrometheusRules across every namespace — this doesn't need to live
+# under kubernetes/platform/ alongside the Helm-chart Applications.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: runtime-security
+  namespace: monitoring
+  labels:
+    release: prometheus-stack
+spec:
+  groups:
+    - name: falco.rules
+      rules:
+        - alert: FalcoAlertRateHigh
+          expr: sum(rate(falco_events_total[5m])) > 0
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Falco is emitting runtime alerts"
+            description: >
+              Falco has emitted at least one runtime detection in the last 5 minutes.
+              Check falcosidekick/Alertmanager for the rule name and pod before
+              treating this as noise — during scripts/runtime-drill.sh this is expected.
+
+        - alert: FalcoCriticalAlert
+          expr: sum(rate(falco_events_total{priority="Critical"}[5m])) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Falco fired a Critical-priority runtime detection"
+            description: >
+              At least one Critical Falco rule matched in the last 5 minutes
+              (e.g. Drill - Sensitive Host Path Mounted). Investigate immediately
+              outside of a planned drill window.
+
+    - name: gatekeeper.rules
+      rules:
+        - alert: GatekeeperDenyRateHigh
+          expr: sum(rate(gatekeeper_violations_total{enforcement_action="deny"}[15m])) > 0
+          for: 5m
+          labels:
+            severity: info
+          annotations:
+            summary: "Gatekeeper is actively denying admission requests"
+            description: >
+              Gatekeeper has blocked at least one admission request in the last
+              15 minutes. Expected during policies/gatekeeper/fixtures/ CI runs;
+              sustained non-zero rate outside CI means something in the cluster
+              is repeatedly attempting a disallowed change.
+
+        - alert: GatekeeperWebhookDown
+          expr: absent(up{job=~".*gatekeeper.*"} == 1)
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Gatekeeper admission webhook target is not being scraped"
+            description: >
+              Prometheus has no healthy scrape target for Gatekeeper. If the
+              webhook itself is down (not just metrics), admission enforcement
+              may be failing open or blocking all applies — check failurePolicy.

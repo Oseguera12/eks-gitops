@@ -1,0 +1,129 @@
+# Falco — runtime threat detection.
+# Gatekeeper enforces policy at admission time (pre-deploy, see policies/gatekeeper/).
+# Falco detects the same TTP family at runtime (post-deploy): privilege escalation,
+# shells spawned in containers, sensitive host-path mounts, writes below binary dirs.
+# Admission and runtime are complementary controls, not redundant ones — a Gatekeeper
+# bypass (e.g. an allowed pod that behaves badly after it starts) is exactly what
+# Falco is positioned to catch. scripts/runtime-drill.sh exercises this path end to end
+# and records the result in metrics/runtime-metrics.json.
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: falco
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  source:
+    repoURL: https://falcosecurity.github.io/charts
+    chart: falco
+    # Pinned to chart 9.1.0 (Falco app v0.44.1) instead of a floating "9.*".
+    # Falco 0.44 removed the legacy (non-modern) eBPF probe, the gVisor engine,
+    # and older gRPC output paths — chart values written against pre-0.44 charts
+    # (e.g. driver.kind: ebpf) will fail to render against this chart. Reviewed
+    # before pinning: this stack only uses driver.kind: modern_ebpf and the
+    # falcosidekick HTTP output, neither of which is affected.
+    targetRevision: "9.1.0"
+    helm:
+      releaseName: falco
+      values: |
+        driver:
+          kind: modern_ebpf  # No kernel module compile, no legacy probe — 0.44 baseline
+          modernEbpf:
+            leastPrivileged: false  # EKS-managed nodes: run privileged, not capability-constrained
+        falco:
+          rules_files:
+            - /etc/falco/falco_rules.yaml
+            - /etc/falco/falco_rules.local.yaml
+            - /etc/falco/rules.d
+          priority: warning
+        # Rendered into a ConfigMap and mounted at /etc/falco/rules.d/ by the chart.
+        # These are intentionally scoped to the runtime-drill namespace so the drill
+        # (scripts/runtime-drill.sh) has a deterministic signal to wait on, on top of
+        # the stock falco_rules.yaml which already covers these TTPs cluster-wide.
+        customRules:
+          rules-runtime-drill.yaml: |-
+            # Self-contained: every list/macro referenced below is defined in this
+            # file. Nothing here depends on the exact stock falco_rules.yaml macro
+            # names staying stable across the 0.44 line, so a future Falco bump
+            # can't silently break the drill by renaming an upstream macro.
+            - macro: drill_namespace
+              condition: (k8s.ns.name = "runtime-drill")
+
+            - macro: container_started
+              condition: (evt.type = container and container.id != host)
+
+            - list: drill_sensitive_mounts
+              items: [/, /etc, /root, /var/run/docker.sock, /var/run/crio/crio.sock,
+                      /var/lib/kubelet, /etc/kubernetes]
+
+            - list: drill_bin_dirs
+              items: [/bin, /sbin, /usr/bin, /usr/sbin, /usr/local/bin, /usr/local/sbin]
+
+            - rule: Drill - Shell Spawned In Container
+              desc: >
+                A shell was spawned inside a container in the runtime-drill namespace.
+                Mirrors the stock "Terminal shell in container" rule but scoped so the
+                drill (scripts/runtime-drill.sh) has an unambiguous, low-noise signal
+                to poll for.
+              condition: >
+                spawned_process and drill_namespace and container and shell_procs
+              output: >
+                Drill: shell spawned in container
+                (user=%user.name command=%proc.cmdline container=%container.name
+                image=%container.image.repository pod=%k8s.pod.name ns=%k8s.ns.name)
+              priority: WARNING
+              tags: [drill, container, shell, mitre_execution]
+
+            - rule: Drill - Sensitive Host Path Mounted
+              desc: >
+                A container in the runtime-drill namespace mounted a sensitive host
+                path (root filesystem, container runtime socket, or kubelet credentials).
+              condition: >
+                container_started and drill_namespace
+                and container.mount_source in (drill_sensitive_mounts)
+              output: >
+                Drill: sensitive host path mounted
+                (mount=%container.mount_source pod=%k8s.pod.name ns=%k8s.ns.name
+                image=%container.image.repository)
+              priority: CRITICAL
+              tags: [drill, container, mitre_privilege_escalation]
+
+            - rule: Drill - Write Below Binary Dir
+              desc: >
+                A process in the runtime-drill namespace wrote to a directory where
+                binaries are stored, a common persistence technique.
+              condition: >
+                open_write and drill_namespace and container
+                and fd.directory in (drill_bin_dirs)
+              output: >
+                Drill: write below binary dir
+                (user=%user.name command=%proc.cmdline file=%fd.name
+                pod=%k8s.pod.name ns=%k8s.ns.name)
+              priority: ERROR
+              tags: [drill, filesystem, mitre_persistence]
+        falcosidekick:
+          enabled: true
+          config:
+            # Route alerts to Alertmanager, which already fans out via the
+            # kube-prometheus-stack Alertmanager config in kubernetes/platform/prometheus-stack.yaml
+            alertmanager:
+              hostport: http://prometheus-stack-kube-prom-alertmanager.monitoring:9093
+              minimumpriority: warning
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            memory: 512Mi
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: security
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

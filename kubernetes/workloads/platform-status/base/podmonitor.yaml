@@ -1,0 +1,19 @@
+# PodMonitor — instructs Prometheus to scrape platform-status pods.
+# The kube-prometheus-stack is configured with podMonitorSelectorNilUsesHelmValues=false
+# so it picks up all PodMonitors across all namespaces.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: platform-status
+  labels:
+    # Must match the serviceMonitorSelector in the Prometheus CR
+    release: prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app: platform-status
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
