@@ -1,18 +1,22 @@
-# ArgoCD Helm values — bootstrap installation.
-# After first install, ArgoCD manages itself via the app-of-apps pattern.
-# See kubernetes/platform/argocd/values.yaml for the GitOps-managed version.
+# ArgoCD Helm values — installed once per cluster by deploy.yml / README
+# Step 7 (helm install, chart pinned there). Argo CD does not manage itself.
 
 global:
-  domain: ""  # No ingress on bootstrap — port-forward only until cert-manager is ready
+  domain: ""  # no ingress — reached only through kubectl port-forward
 
 configs:
   params:
-    server.insecure: "true"  # TLS terminated at the ingress layer
+    # Plain HTTP inside the cluster. Safe only because argocd-server is
+    # ClusterIP and never exposed; add TLS before giving it an ingress.
+    server.insecure: "true"
   cm:
-    # Enable Application Sets and the app-of-apps pattern
     application.resourceTrackingMethod: annotation
-    # Sync policy: auto-prune and self-heal
-    resource.customizations.health.argoproj.io/Application: |
+    # Health check for child Applications. Without it Argo CD treats every
+    # Application as Healthy immediately, so sync waves in the app-of-apps
+    # don't actually wait (e.g. CRDs from a wave-1 chart aren't there yet
+    # when wave 2 applies). The key uses `_`, not `/` — ConfigMap keys
+    # can't contain a slash and the API server rejects argocd-cm.
+    resource.customizations.health.argoproj.io_Application: |
       hs = {}
       hs.status = "Progressing"
       hs.message = ""

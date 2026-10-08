@@ -1,0 +1,42 @@
+{
+  "ci": {
+    "base_url": "http://127.0.0.1:8080",
+    "expected": {
+      "environment": "ci",
+      "cluster": "ci",
+      "namespace": "ci"
+    },
+    "version_pattern": "^sha-[0-9a-f]{7}$",
+    "latency_p95_budget_ms": 100
+  },
+  "local": {
+    "base_url": "http://127.0.0.1:8080",
+    "expected": {
+      "environment": "unknown",
+      "cluster": "unknown",
+      "namespace": "unknown"
+    },
+    "version_pattern": "^.+$",
+    "latency_p95_budget_ms": 250
+  },
+  "staging": {
+    "base_url": "http://127.0.0.1:18080",
+    "expected": {
+      "environment": "staging",
+      "cluster": "eks-gitops",
+      "namespace": "platform-status-staging"
+    },
+    "version_pattern": "^sha-[0-9a-f]{7}$",
+    "latency_p95_budget_ms": 500
+  },
+  "prod": {
+    "base_url": "http://127.0.0.1:18080",
+    "expected": {
+      "environment": "prod",
+      "cluster": "eks-gitops",
+      "namespace": "platform-status"
+    },
+    "version_pattern": "^sha-[0-9a-f]{7}$",
+    "latency_p95_budget_ms": 500
+  }
+}

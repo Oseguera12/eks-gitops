@@ -87,7 +87,9 @@ fi
 
 log ""
 log "--- platform-status app (namespace=${NAMESPACE}) ---"
-kubectl port-forward "svc/platform-status-stable" 18080:8080 -n "${NAMESPACE}" >/dev/null 2>&1 &
+# Service port is 80 (targetPort 8080) — kubectl resolves svc/ forwards by
+# service port, so 8080 here would be rejected.
+kubectl port-forward "svc/platform-status-stable" 18080:80 -n "${NAMESPACE}" >/dev/null 2>&1 &
 PF_PID=$!
 sleep 3
 check "/health returns healthy" bash -c "curl -sf http://localhost:18080/health | grep -q healthy"
@@ -138,6 +140,7 @@ log ""
 log "--- Metrics pipeline ---"
 check "PodMonitor for platform-status exists" bash -c \
   "kubectl get podmonitor -n '${NAMESPACE}' platform-status >/dev/null 2>&1"
+# Inside this string, ${NAMESPACE} expands now; the escaped \$ vars expand in the child bash.
 check "Prometheus is up and has a target for platform-status" bash -c "
   kubectl port-forward svc/kube-prometheus-stack-prometheus 19090:9090 -n monitoring >/dev/null 2>&1 &
   pf=\$!

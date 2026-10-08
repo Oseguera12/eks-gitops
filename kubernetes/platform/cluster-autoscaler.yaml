@@ -13,7 +13,9 @@ spec:
   source:
     repoURL: https://kubernetes.github.io/autoscaler
     chart: cluster-autoscaler
-    targetRevision: "9.43.*"
+    # Chart 9.59.x ships Cluster Autoscaler 1.35 — its minor must match the
+    # cluster's (terraform/variables.tf cluster_version); 9.43 was 1.31.
+    targetRevision: "9.59.*"
     helm:
       releaseName: cluster-autoscaler
       values: |

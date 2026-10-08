@@ -1,4 +1,4 @@
-name: Verify + Runtime Metrics — Health Check + Falco Drill + Gatekeeper Fixtures + Chaos Drill (Manual)
+name: Verify + Runtime Metrics — Health Check + Playwright + Falco Drill + Gatekeeper Fixtures + Chaos Drill (Manual)
 
 # Manual, cluster-must-already-be-up workflow — the single place to check
 # both "does everything actually work" and "what are the metrics", so you
@@ -6,16 +6,19 @@ name: Verify + Runtime Metrics — Health Check + Falco Drill + Gatekeeper Fixtu
 #   1. Run scripts/verify.sh (nodes, pods, ArgoCD app health, app health
 #      endpoints, Rollout status, Gatekeeper enforcement, Prometheus scrape
 #      target) — results posted to this run's Job Summary
-#   2. Run the Gatekeeper admission fixtures (policies/gatekeeper/fixtures/)
-#   3. Run the Falco runtime drill (scripts/runtime-drill.sh)
-#   4. Run the chaos drill (scripts/chaos-drill.sh) — pod-kill always,
+#   2. Run the Playwright regression suite (app/e2e) against live staging
+#      through a port-forward — the same cases CI runs against the built
+#      image, now with staging's expected environment wiring
+#   3. Run the Gatekeeper admission fixtures (policies/gatekeeper/fixtures/)
+#   4. Run the Falco runtime drill (scripts/runtime-drill.sh)
+#   5. Run the chaos drill (scripts/chaos-drill.sh) — pod-kill always,
 #      node-drain only if run_node_drain is true (slow: new EC2 instance +
 #      kubelet join)
-#   5. Merge all four, plus this run's CI gate results and a manual cost
+#   6. Merge all of it, plus this run's CI gate results and a manual cost
 #      snapshot, into metrics/runtime-metrics.json (scripts/emit-runtime-metrics.py)
-#   6. Upload the verify log, chaos log, and metrics bundle as pipeline
-#      artifacts — the system of record for MTTD/MTTR, not a number typed
-#      into a slide.
+#   7. Upload the verify log, Playwright results, chaos log, and metrics
+#      bundle as pipeline artifacts — the system of record for MTTD/MTTR,
+#      not a number typed into a slide.
 #
 # Does NOT provision or destroy the cluster. Run deploy.yml first, run this,
 # then run the "Infrastructure — Terraform Destroy" workflow before end of
@@ -54,21 +57,45 @@ permissions:
 env:
   AWS_REGION: us-east-1
   CLUSTER_NAME: eks-gitops
+  KUBECTL_VERSION: v1.35.9  # within one minor of the cluster
 
 jobs:
   runtime-metrics:
     name: Falco Drill + Gatekeeper Fixtures + Emit Metrics
     runs-on: ubuntu-latest
+    # Inputs reach shell steps only through env vars, never ${{ }} inside a
+    # script body, so a crafted input string can't become shell code.
+    env:
+      WINDOW_START: ${{ inputs.window_start }}
+      COST_PER_HOUR: ${{ inputs.cost_per_hour }}
+      COST_SOURCE: ${{ inputs.cost_source }}
+      RUN_NODE_DRAIN: ${{ inputs.run_node_drain && '1' || '0' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs
+        run: |
+          [[ "${WINDOW_START}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+            || { echo "window_start must be ISO-8601 UTC, e.g. 2026-08-05T18:00:00Z"; exit 1; }
+          [[ "${COST_PER_HOUR}" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
+            || { echo "cost_per_hour must be a number"; exit 1; }
 
       - name: Configure AWS credentials (OIDC — no long-lived keys)
         id: aws-auth
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: GitHubActions-RuntimeMetrics-${{ github.run_id }}
+
+      - name: Install kubectl (pinned, checksum-verified)
+        run: |
+          base="https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64"
+          curl -fsSLO "${base}/kubectl"
+          echo "$(curl -fsSL "${base}/kubectl.sha256")  kubectl" | sha256sum --check --strict -
+          sudo install -m 0755 kubectl /usr/local/bin/kubectl
 
       - name: Point kubectl at the cluster
         run: aws eks update-kubeconfig --region "${AWS_REGION}" --name "${CLUSTER_NAME}"
@@ -86,6 +113,47 @@ jobs:
           cat verify-results/verify-*.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no verify log produced" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: app/e2e/requirements.txt
+
+      - name: Install Playwright + Chromium
+        run: |
+          pip install -r app/e2e/requirements.txt
+          python -m playwright install --with-deps chromium
+
+      # Staging, not prod: this is the environment ci-cd.yml just deployed.
+      # TC-03/TC-04 catch a stale image or a staging pod reporting prod.
+      - name: Run Playwright regression against live staging
+        id: regression
+        continue-on-error: true
+        env:
+          E2E_ENV: staging
+          E2E_RESULTS_DIR: ${{ github.workspace }}/app/e2e/test-results
+        run: |
+          kubectl port-forward svc/platform-status-stable 18080:80 \
+            -n platform-status-staging >/tmp/port-forward.log 2>&1 &
+          pf_pid=$!
+          trap 'kill "${pf_pid}" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 20); do
+            curl -sf http://127.0.0.1:18080/health >/dev/null && break
+            sleep 1
+          done
+
+          start_ms=$(date +%s%3N)  # %3N (milliseconds) is GNU date only; fine on ubuntu-latest
+          rc=0
+          (cd app/e2e && python -m pytest) || rc=$?
+          echo "duration_ms=$(( $(date +%s%3N) - start_ms ))" >> "$GITHUB_OUTPUT"
+
+          python3 scripts/summarize-regression.py \
+            --project eks-gitops \
+            --results-dir "${E2E_RESULTS_DIR}" \
+            --plan app/e2e/MANUAL_TEST_PLAN.md \
+            --out "${E2E_RESULTS_DIR}/regression-metrics.json" || rc=1
+          exit "${rc}"
+
       - name: Run Gatekeeper admission fixtures
         id: fixtures
         run: policies/gatekeeper/fixtures/run-fixtures.sh /tmp/gatekeeper-fixtures.json
@@ -98,8 +166,6 @@ jobs:
 
       - name: Run chaos drill
         id: chaos
-        env:
-          RUN_NODE_DRAIN: ${{ inputs.run_node_drain && '1' || '0' }}
         run: scripts/chaos-drill.sh /tmp/chaos-drill.json
         continue-on-error: true
 
@@ -128,42 +194,61 @@ jobs:
           fi
 
       - name: Emit metrics/runtime-metrics.json
+        env:
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          REGRESSION_OUTCOME: ${{ steps.regression.outcome }}
+          REGRESSION_MS: ${{ steps.regression.outputs.duration_ms }}
+          FIXTURES_OUTCOME: ${{ steps.fixtures.outcome }}
+          DRILL_OUTCOME: ${{ steps.drill.outcome }}
+          CHAOS_OUTCOME: ${{ steps.chaos.outcome }}
         run: |
+          gate() { [ "$1" = success ] && echo pass || echo fail; }
           # Chaos recovery times have no dedicated schema field (unlike
           # runtime/admission), so they ride in the gate's duration_ms —
           # real seconds, not just pass/fail, without touching the schema
-          # shared across all 4 portfolio projects.
+          # shared across all 4 portfolio projects. The staging Playwright
+          # run's wall time rides the same way.
           pod_kill_ms=$(jq '((.experiments[] | select(.name=="pod-kill") | .recovery_seconds) // 0) * 1000' /tmp/chaos-drill.json 2>/dev/null || echo 0)
           gate_args=(
-            --gate "live-verify:$( [ '${{ steps.verify.outcome }}' = success ] && echo pass || echo fail ):0"
-            --gate "gatekeeper-fixtures:$( [ '${{ steps.fixtures.outcome }}' = success ] && echo pass || echo fail ):0"
-            --gate "falco-drill:$( [ '${{ steps.drill.outcome }}' = success ] && echo pass || echo fail ):0"
-            --gate "chaos-pod-kill:$( [ '${{ steps.chaos.outcome }}' = success ] && echo pass || echo fail ):${pod_kill_ms}"
+            --gate "live-verify:$(gate "${VERIFY_OUTCOME}"):0"
+            --gate "playwright-staging:$(gate "${REGRESSION_OUTCOME}"):${REGRESSION_MS:-0}"
+            --gate "gatekeeper-fixtures:$(gate "${FIXTURES_OUTCOME}"):0"
+            --gate "falco-drill:$(gate "${DRILL_OUTCOME}"):0"
+            --gate "chaos-pod-kill:$(gate "${CHAOS_OUTCOME}"):${pod_kill_ms}"
           )
-          if [ "${{ inputs.run_node_drain }}" = "true" ]; then
+          if [ "${RUN_NODE_DRAIN}" = "1" ]; then
+            # `// 0`: recovery_seconds is null when the drain didn't recover in time.
             node_drain_ms=$(jq '((.experiments[] | select(.name=="node-drain") | .recovery_seconds) // 0) * 1000' /tmp/chaos-drill.json 2>/dev/null || echo 0)
-            gate_args+=(--gate "chaos-node-drain:$( [ '${{ steps.chaos.outcome }}' = success ] && echo pass || echo fail ):${node_drain_ms}")
+            gate_args+=(--gate "chaos-node-drain:$(gate "${CHAOS_OUTCOME}"):${node_drain_ms}")
           fi
 
           python3 scripts/emit-runtime-metrics.py \
             --project eks-gitops \
-            --window-start "${{ inputs.window_start }}" \
+            --window-start "${WINDOW_START}" \
             --window-end "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             "${gate_args[@]}" \
             --gates-json /tmp/pipeline-gates/gates.json \
             --admission-json /tmp/gatekeeper-fixtures.json \
             --runtime-json /tmp/runtime-drill.json \
             --oidc-success \
-            --cost-per-hour "${{ inputs.cost_per_hour }}" \
-            --cost-source "${{ inputs.cost_source }}"
+            --cost-per-hour "${COST_PER_HOUR}" \
+            --cost-source "${COST_SOURCE}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: runtime-metrics
           path: metrics/runtime-metrics.json
           retention-days: 90
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: playwright-staging
+          path: app/e2e/test-results/
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: verify-log
@@ -171,7 +256,7 @@ jobs:
           retention-days: 90
           if-no-files-found: ignore
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: chaos-drill
@@ -180,11 +265,18 @@ jobs:
           if-no-files-found: ignore
 
       - name: Fail the job if any check failed
-        if: steps.verify.outcome != 'success' || steps.fixtures.outcome != 'success' || steps.drill.outcome != 'success' || steps.chaos.outcome != 'success'
+        if: steps.verify.outcome != 'success' || steps.regression.outcome != 'success' || steps.fixtures.outcome != 'success' || steps.drill.outcome != 'success' || steps.chaos.outcome != 'success'
+        env:
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          REGRESSION_OUTCOME: ${{ steps.regression.outcome }}
+          FIXTURES_OUTCOME: ${{ steps.fixtures.outcome }}
+          DRILL_OUTCOME: ${{ steps.drill.outcome }}
+          CHAOS_OUTCOME: ${{ steps.chaos.outcome }}
         run: |
-          echo "Live verify:          ${{ steps.verify.outcome }}"
-          echo "Gatekeeper fixtures:  ${{ steps.fixtures.outcome }}"
-          echo "Falco drill:          ${{ steps.drill.outcome }}"
-          echo "Chaos drill:          ${{ steps.chaos.outcome }}"
+          echo "Live verify:          ${VERIFY_OUTCOME}"
+          echo "Playwright (staging): ${REGRESSION_OUTCOME}"
+          echo "Gatekeeper fixtures:  ${FIXTURES_OUTCOME}"
+          echo "Falco drill:          ${DRILL_OUTCOME}"
+          echo "Chaos drill:          ${CHAOS_OUTCOME}"
           echo "metrics/runtime-metrics.json was still written and uploaded — check the artifact and Job Summary for detail."
           exit 1

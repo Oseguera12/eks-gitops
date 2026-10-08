@@ -25,7 +25,9 @@ from prometheus_client import (
 
 # ─── Application bootstrap ────────────────────────────────────────────────────
 
-APP_VERSION = os.getenv("APP_VERSION", "dev")
+# `or`, not a getenv default: an env var set to "" (e.g. a downward-API
+# fieldRef to a missing label) would otherwise make FastAPI refuse to start.
+APP_VERSION = os.getenv("APP_VERSION") or "dev"
 ENVIRONMENT = os.getenv("ENVIRONMENT", "unknown")
 CLUSTER_NAME = os.getenv("CLUSTER_NAME", "unknown")
 NAMESPACE = os.getenv("POD_NAMESPACE", "unknown")
@@ -36,13 +38,18 @@ START_TIME = time.monotonic()
 app = FastAPI(
     title="platform-status",
     version=APP_VERSION,
-    description="Platform observability service — health, readiness, and runtime metadata.",
+    description=(
+        "Platform observability service — health, readiness, and runtime metadata."
+    ),
     docs_url="/docs",
     redoc_url=None,
 )
 
+# Public, unauthenticated, read-only status data: any origin may GET it.
+# Regression case TC-11 asserts non-GET preflights stay rejected.
 app.add_middleware(
     CORSMiddleware,
+    # nosemgrep: python.fastapi.security.wildcard-cors.wildcard-cors
     allow_origins=["*"],
     allow_methods=["GET"],
     allow_headers=["*"],
@@ -129,7 +136,11 @@ def info() -> dict[str, Any]:
     }
 
 
-@app.get("/metrics", summary="Prometheus metrics scrape target", include_in_schema=False)
+@app.get(
+    "/metrics",
+    summary="Prometheus metrics scrape target",
+    include_in_schema=False,
+)
 def metrics() -> Response:
     """
     Prometheus-format metrics endpoint.

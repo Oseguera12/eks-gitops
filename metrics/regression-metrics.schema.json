@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Oseguera12/runtime-metrics/schema/v1/regression-metrics.schema.json",
+  "title": "Playwright Regression Metrics",
+  "description": "Written by scripts/summarize-regression.py after each Playwright regression run (CI against the built image, or a live environment via port-forward). Same file in eks-gitops and aks-pipeline. Kept separate from runtime-metrics.schema.json so that shared four-project contract stays unchanged; the regression job's wall time still lands in runtime-metrics.json's gates[] through the pipeline-gates artifact.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "project",
+    "collected_at",
+    "target_env",
+    "commit",
+    "run_url",
+    "tooling",
+    "container",
+    "plan",
+    "results",
+    "latency_ms",
+    "cases"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": "1" },
+    "project": { "type": "string", "enum": ["eks-gitops", "aks-pipeline"] },
+    "collected_at": { "type": "string", "format": "date-time" },
+    "target_env": { "type": "string", "enum": ["ci", "local", "staging", "prod"] },
+    "commit": { "type": ["string", "null"] },
+    "run_url": { "type": ["string", "null"] },
+    "tooling": {
+      "type": "object",
+      "required": ["playwright_version", "browser"],
+      "additionalProperties": false,
+      "properties": {
+        "playwright_version": { "type": "string" },
+        "browser": { "type": "string" }
+      }
+    },
+    "container": {
+      "type": "object",
+      "description": "Only populated for target_env=ci, where the job builds and starts the image itself.",
+      "required": ["ready_seconds", "image_size_bytes", "hardened_runtime"],
+      "additionalProperties": false,
+      "properties": {
+        "ready_seconds": { "type": ["number", "null"], "minimum": 0 },
+        "image_size_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "hardened_runtime": {
+          "type": "boolean",
+          "description": "True when the container ran read-only, non-root, all capabilities dropped, no-new-privileges — the same securityContext the cluster enforces."
+        }
+      }
+    },
+    "plan": {
+      "type": "object",
+      "required": ["cases_total", "cases_automated", "cases_manual_only", "automation_pct"],
+      "additionalProperties": false,
+      "properties": {
+        "cases_total": { "type": "integer", "minimum": 0 },
+        "cases_automated": { "type": "integer", "minimum": 0 },
+        "cases_manual_only": { "type": "integer", "minimum": 0 },
+        "automation_pct": { "type": "number", "minimum": 0 }
+      }
+    },
+    "results": {
+      "type": "object",
+      "required": ["tests", "passed", "failed", "skipped", "pass_rate_pct", "duration_seconds"],
+      "additionalProperties": false,
+      "properties": {
+        "tests": { "type": "integer", "minimum": 0 },
+        "passed": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0 },
+        "pass_rate_pct": { "type": "number", "minimum": 0 },
+        "duration_seconds": { "type": "number", "minimum": 0 }
+      }
+    },
+    "latency_ms": {
+      "type": "object",
+      "description": "Keyed by request path. Client-side wall time per request, measured by the suite."
+    },
+    "cases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["case", "test", "outcome", "duration_ms"],
+        "additionalProperties": false,
+        "properties": {
+          "case": { "type": ["string", "null"] },
+          "test": { "type": "string" },
+          "outcome": { "type": "string", "enum": ["pass", "fail", "skipped"] },
+          "duration_ms": { "type": "number", "minimum": 0 }
+        }
+      }
+    }
+  }
+}

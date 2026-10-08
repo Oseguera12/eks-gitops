@@ -69,8 +69,11 @@ resource "aws_iam_role_policy_attachment" "node_ssm_policy" {
 }
 
 # ─── Security Groups ──────────────────────────────────────────────────────────
+# Managed node groups without a launch template run on the EKS-created
+# cluster security group, so there is deliberately no separate node SG here.
 
 resource "aws_security_group" "cluster" {
+  #checkov:skip=CKV_AWS_382:Control plane ENIs need outbound to AWS APIs and nodes across ports; private subnets egress only via the NAT Gateway.
   name        = "${var.cluster_name}-cluster-sg"
   description = "EKS cluster control plane security group."
   vpc_id      = var.vpc_id
@@ -86,44 +89,66 @@ resource "aws_security_group" "cluster" {
   tags = { Name = "${var.cluster_name}-cluster-sg" }
 }
 
-resource "aws_security_group" "node" {
-  name        = "${var.cluster_name}-node-sg"
-  description = "EKS managed node group security group."
-  vpc_id      = var.vpc_id
+# ─── KMS — Kubernetes Secrets envelope encryption ─────────────────────────────
 
-  ingress {
-    description     = "Allow control plane to reach nodes"
-    from_port       = 0
-    to_port         = 0
-    protocol        = "-1"
-    security_groups = [aws_security_group.cluster.id]
+data "aws_caller_identity" "current" {}
+data "aws_partition" "current" {}
+
+data "aws_iam_policy_document" "secrets_kms" {
+  #checkov:skip=CKV_AWS_109:Key policy — "*" means this key only; this is AWS's default account-root delegation statement.
+  #checkov:skip=CKV_AWS_111:Same — root delegation lets IAM policies (cluster_kms below) grant scoped use.
+  #checkov:skip=CKV_AWS_356:Same — key policies cannot name their own key ARN.
+  statement {
+    sid       = "AccountAdministration"
+    actions   = ["kms:*"]
+    resources = ["*"]
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:root"]
+    }
   }
+}
 
-  ingress {
-    description = "Allow node-to-node communication"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    self        = true
+resource "aws_kms_key" "secrets" {
+  description             = "${var.cluster_name} Kubernetes Secrets envelope encryption"
+  enable_key_rotation     = true
+  deletion_window_in_days = 7
+  policy                  = data.aws_iam_policy_document.secrets_kms.json
+}
+
+resource "aws_kms_alias" "secrets" {
+  name          = "alias/${var.cluster_name}-secrets"
+  target_key_id = aws_kms_key.secrets.key_id
+}
+
+data "aws_iam_policy_document" "cluster_kms" {
+  statement {
+    actions   = ["kms:Encrypt", "kms:Decrypt", "kms:ListGrants", "kms:DescribeKey"]
+    resources = [aws_kms_key.secrets.arn]
   }
+}
 
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow all outbound"
-  }
-
-  tags = { Name = "${var.cluster_name}-node-sg" }
+resource "aws_iam_role_policy" "cluster_kms" {
+  name   = "${var.cluster_name}-cluster-secrets-kms"
+  role   = aws_iam_role.cluster.id
+  policy = data.aws_iam_policy_document.cluster_kms.json
 }
 
 # ─── EKS Cluster ──────────────────────────────────────────────────────────────
 
 resource "aws_eks_cluster" "this" {
+  #checkov:skip=CKV_AWS_38:GitHub-hosted runners have no fixed egress IPs; access is gated by IAM/OIDC (see ADR at top of file).
+  #checkov:skip=CKV_AWS_39:Same ADR — a private-only endpoint would need a VPN or self-hosted runner.
   name     = var.cluster_name
   version  = var.cluster_version
   role_arn = aws_iam_role.cluster.arn
+
+  encryption_config {
+    resources = ["secrets"]
+    provider {
+      key_arn = aws_kms_key.secrets.arn
+    }
+  }
 
   vpc_config {
     subnet_ids              = concat(var.private_subnet_ids, var.public_subnet_ids)
@@ -140,6 +165,7 @@ resource "aws_eks_cluster" "this" {
 
   depends_on = [
     aws_iam_role_policy_attachment.cluster_policy,
+    aws_iam_role_policy.cluster_kms,
   ]
 }
 
@@ -169,8 +195,8 @@ resource "aws_eks_node_group" "general" {
 
   tags = {
     # Cluster Autoscaler discovers the ASG via these tags
-    "k8s.io/cluster-autoscaler/enabled"                    = "true"
-    "k8s.io/cluster-autoscaler/${var.cluster_name}"        = "owned"
+    "k8s.io/cluster-autoscaler/enabled"             = "true"
+    "k8s.io/cluster-autoscaler/${var.cluster_name}" = "owned"
   }
 
   depends_on = [
@@ -180,6 +206,8 @@ resource "aws_eks_node_group" "general" {
     aws_iam_role_policy_attachment.node_ssm_policy,
   ]
 
+  # Cluster Autoscaler owns desired_size at runtime; without this every apply
+  # would reset the node count back to the Terraform value.
   lifecycle {
     ignore_changes = [scaling_config[0].desired_size]
   }
@@ -189,8 +217,8 @@ resource "aws_eks_node_group" "general" {
 # Managed by AWS — auto-patched for security and compatibility.
 
 resource "aws_eks_addon" "vpc_cni" {
-  cluster_name  = aws_eks_cluster.this.name
-  addon_name    = "vpc-cni"
+  cluster_name = aws_eks_cluster.this.name
+  addon_name   = "vpc-cni"
   # Resolve conflicts by letting the addon overwrite fields it manages
   resolve_conflicts_on_create = "OVERWRITE"
   resolve_conflicts_on_update = "OVERWRITE"
@@ -209,6 +237,8 @@ resource "aws_eks_addon" "coredns" {
   resolve_conflicts_on_create = "OVERWRITE"
   resolve_conflicts_on_update = "OVERWRITE"
 
+  # CoreDNS and the EBS CSI controller run as pods; created before any node
+  # exists they stay Degraded and the addon create times out.
   depends_on = [aws_eks_node_group.general]
 }
 

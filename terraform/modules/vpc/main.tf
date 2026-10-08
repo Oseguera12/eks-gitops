@@ -14,6 +14,7 @@
 # ─── VPC ──────────────────────────────────────────────────────────────────────
 
 resource "aws_vpc" "this" {
+  #checkov:skip=CKV2_AWS_11:Ephemeral demo VPC (destroyed every session); EKS control-plane audit logs are enabled instead. Listed under Future Improvements.
   cidr_block           = var.vpc_cidr
   enable_dns_support   = true
   enable_dns_hostnames = true # Required for EKS node-to-API communication
@@ -33,6 +34,9 @@ resource "aws_internet_gateway" "this" {
 
 # ─── Public Subnets ───────────────────────────────────────────────────────────
 
+# Public subnets host only the NAT Gateway and internet-facing load balancers;
+# nodes run in the private subnets below.
+# nosemgrep: terraform.aws.security.aws-subnet-has-public-ip-address.aws-subnet-has-public-ip-address
 resource "aws_subnet" "public" {
   count = length(var.public_subnet_cidrs)
 
@@ -64,8 +68,8 @@ resource "aws_subnet" "private" {
     # EKS uses this tag to identify subnets where internal LBs are created
     "kubernetes.io/role/internal-elb" = "1"
     # Cluster Autoscaler uses this tag to identify which ASGs to manage
-    "k8s.io/cluster-autoscaler/enabled"              = "true"
-    "k8s.io/cluster-autoscaler/${var.cluster_name}"  = "owned"
+    "k8s.io/cluster-autoscaler/enabled"             = "true"
+    "k8s.io/cluster-autoscaler/${var.cluster_name}" = "owned"
   }
 }
 

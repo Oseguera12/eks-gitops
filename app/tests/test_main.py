@@ -1,6 +1,5 @@
 """Unit tests for platform-status endpoints."""
 
-import pytest
 from fastapi.testclient import TestClient
 
 from src.main import app
@@ -32,7 +31,14 @@ class TestInfoEndpoint:
 
     def test_info_body_has_required_keys(self) -> None:
         body = client.get("/info").json()
-        required = {"version", "environment", "cluster", "namespace", "pod", "uptime_seconds"}
+        required = {
+            "version",
+            "environment",
+            "cluster",
+            "namespace",
+            "pod",
+            "uptime_seconds",
+        }
         assert required.issubset(body.keys())
 
 

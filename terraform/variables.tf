@@ -19,12 +19,13 @@ variable "environment" {
 variable "cluster_version" {
   description = "Kubernetes version for the EKS cluster."
   type        = string
-  # 1.32 is the EKS default as of early 2026; 1.31 is still supported but no
-  # longer the default for new clusters. The three managed addons below
+  # 1.32 left EKS standard support on 2026-03-23; running it now bills the
+  # control plane at the extended-support rate ($0.60/hr vs $0.10/hr).
+  # 1.35 is in standard support until 2027-03-27. The three managed addons below
   # (vpc-cni, kube-proxy, coredns, aws-ebs-csi-driver) omit addon_version, so
   # AWS auto-selects the latest addon build compatible with this cluster
   # version — no addon pins needed to move with this bump.
-  default = "1.32"
+  default = "1.35"
 }
 
 # ─── VPC ──────────────────────────────────────────────────────────────────────
@@ -67,7 +68,7 @@ variable "node_instance_type" {
   # stack, Gatekeeper, Falco, Argo Rollouts, Cluster Autoscaler, ESO) to
   # schedule cleanly. t3.micro (1 GB) is Free Tier eligible but too small —
   # combined pod memory requests exceed what 2-3 micro nodes can allocate.
-  default     = "t3.medium"
+  default = "t3.medium"
 }
 
 variable "node_min_size" {

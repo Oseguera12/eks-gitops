@@ -2,7 +2,8 @@ name: CI / CD — DevSecOps Pipeline
 
 # Triggers:
 #   push to main  → full pipeline (security scan + build + sign + deploy)
-#   pull request  → security scan + build + test only (no deploy, no ECR push)
+#   pull request  → security scans + lint + unit tests + Playwright regression
+#                   (no ECR push, no deploy)
 #
 # Authentication:
 #   AWS credentials are NEVER stored as secrets.
@@ -10,17 +11,23 @@ name: CI / CD — DevSecOps Pipeline
 #   a short-lived GitHub token for temporary AWS credentials scoped to the
 #   iam_github_oidc IAM role created by Terraform.
 #
+# Supply chain:
+#   Every third-party action is pinned to a full commit SHA (tag in the
+#   trailing comment). .github/dependabot.yml opens PRs to bump them.
+#
 # Pipeline stages (in dependency order):
 #   1. secret-scan    — Gitleaks: detect hardcoded credentials before any build
 #   2. sast           — Semgrep: static analysis for security bugs
 #   3. sca            — pip-audit: known CVEs in Python dependencies
 #   4. lint           — Hadolint (Dockerfile) + Ruff (Python)
 #   5. test           — pytest unit tests with coverage report
-#   6. iac-scan       — Checkov: IaC policy scan on Terraform files
-#   7. build-push     — Multi-platform Docker build, push to ECR (main only)
-#   8. sign           — Cosign keyless image signing via Sigstore (main only)
-#   9. scan-image     — Trivy full image scan + SBOM generation (main only)
-#  10. deploy         — Update image tag in Git, ArgoCD auto-syncs (main only)
+#   6. regression     — Playwright: black-box regression suite against the
+#                       built container, run with the cluster's securityContext
+#   7. iac-scan       — Checkov: IaC policy scan on Terraform files
+#   8. build-push     — Docker build, push to ECR (main only)
+#   9. sign           — Cosign keyless image signing via Sigstore (main only)
+#  10. scan-image     — Trivy full image scan + SBOM generation (main only)
+#  11. deploy         — Update image digest in Git, ArgoCD syncs staging (main only)
 
 on:
   push:
@@ -33,12 +40,19 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded PR runs are cancelled; main runs never are, so a deploy can't
+  # be killed halfway through writing the image digest back to Git.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: platform-status
   IMAGE_NAME: platform-status
+  PYTHON_VERSION: "3.12"
+  CLUSTER_NAME: eks-gitops
+  # Within one minor of the cluster (terraform/variables.tf kubernetes_version);
+  # the runner's preinstalled kubectl tracks the newest release instead.
+  KUBECTL_VERSION: v1.35.9
 
 jobs:
   # ─── Stage 1: Secret Scanning ─────────────────────────────────────────────
@@ -48,17 +62,21 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0  # Full history required for Gitleaks commit-range scan
+          persist-credentials: false
 
       - name: Run Gitleaks
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
 
   # ─── Stage 2: SAST ────────────────────────────────────────────────────────
+  # returntocorp/semgrep-action is deprecated; the CLI is the supported path.
+  # --error makes findings blocking. Intentional exceptions are inline
+  # `nosemgrep` comments with a reason, or listed in .semgrepignore.
   sast:
     name: SAST (Semgrep)
     runs-on: ubuntu-latest
@@ -67,19 +85,33 @@ jobs:
       contents: read
       security-events: write  # Upload SARIF to GitHub Security tab
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Run Semgrep
-        uses: returntocorp/semgrep-action@v1
+        run: |
+          pip install semgrep==1.179.0
+          semgrep scan \
+            --config p/python \
+            --config p/docker \
+            --config p/kubernetes \
+            --config p/secrets \
+            --config p/owasp-top-ten \
+            --config p/github-actions \
+            --metrics=off \
+            --error \
+            --sarif-output=semgrep.sarif
+
+      - uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        if: always()
         with:
-          config: >-
-            p/python
-            p/docker
-            p/kubernetes
-            p/secrets
-            p/owasp-top-ten
-        env:
-          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+          sarif_file: semgrep.sarif
+          category: semgrep
 
   # ─── Stage 3: SCA — Dependency CVE Scan ──────────────────────────────────
   sca:
@@ -87,25 +119,29 @@ jobs:
     runs-on: ubuntu-latest
     needs: secret-scan
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: "3.12"
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install pip-audit
         run: pip install pip-audit
 
       - name: Audit dependencies
+        # Runtime, unit-test, and Playwright dependencies — all three run in CI.
         run: |
           pip-audit \
             --requirement app/requirements.txt \
+            --requirement app/requirements-dev.txt \
+            --requirement app/e2e/requirements.txt \
             --format json \
             --output pip-audit-results.json \
             --strict
-        continue-on-error: false
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: pip-audit-results
@@ -118,22 +154,25 @@ jobs:
     runs-on: ubuntu-latest
     needs: secret-scan
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Hadolint — Dockerfile best practices
-        uses: hadolint/hadolint-action@v3.1.0
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
         with:
           dockerfile: app/Dockerfile
           failure-threshold: warning
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Ruff — Python linter
         run: |
-          pip install ruff
-          ruff check app/src/ app/tests/
+          pip install "$(grep '^ruff==' app/requirements-dev.txt)"
+          ruff check app/src/ app/tests/ app/e2e/ scripts/
+          ruff format --check app/src/ app/tests/ app/e2e/
 
   # ─── Stage 5: Unit Tests ──────────────────────────────────────────────────
   test:
@@ -141,11 +180,13 @@ jobs:
     runs-on: ubuntu-latest
     needs: [sca, lint]
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: "3.12"
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install dependencies
         run: |
@@ -161,13 +202,74 @@ jobs:
             --cov-fail-under=80 \
             -v
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-report
           path: app/coverage.xml
           retention-days: 30
 
-  # ─── Stage 6: IaC Security Scan ───────────────────────────────────────────
+  # ─── Stage 6: Playwright Regression ───────────────────────────────────────
+  # Builds the same image build-push will push (same Dockerfile, build args,
+  # and GHA layer cache), starts it read-only / non-root / no capabilities,
+  # waits on the image's own HEALTHCHECK, then runs app/e2e against it.
+  # Results land in the job summary and the playwright-regression artifact
+  # (regression-metrics.json, JUnit XML, and traces for any failure).
+  regression:
+    name: Regression Tests (Playwright)
+    runs-on: ubuntu-latest
+    needs: [sca, lint]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compute build version
+        id: version
+        run: echo "app-version=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build image under test
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: app/
+          file: app/Dockerfile
+          load: true
+          push: false
+          tags: platform-status:regression
+          build-args: APP_VERSION=${{ steps.version.outputs.app-version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: app/e2e/requirements.txt
+
+      - name: Install Playwright + Chromium
+        run: |
+          pip install -r app/e2e/requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run regression suite
+        env:
+          IMAGE: platform-status:regression
+          APP_VERSION: ${{ steps.version.outputs.app-version }}
+          PROJECT: eks-gitops
+        run: scripts/run-regression.sh
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: playwright-regression
+          path: app/e2e/test-results/
+          retention-days: 30
+          if-no-files-found: warn
+
+  # ─── Stage 7: IaC Security Scan ───────────────────────────────────────────
   iac-scan:
     name: IaC Scan (Checkov)
     runs-on: ubuntu-latest
@@ -176,31 +278,35 @@ jobs:
       contents: read
       security-events: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Run Checkov
-        uses: bridgecrewio/checkov-action@v12
+        uses: bridgecrewio/checkov-action@c13aafd679d3814a25067d10fcaf98c4f7594931 # v12.3131.0
         with:
           directory: terraform/
           framework: terraform
           output_format: sarif
           output_file_path: checkov-results.sarif
           soft_fail: false
-          # Skip checks that are intentional deviations (documented in ADRs)
+          # Repo-wide skips only. Resource-specific exceptions are inline
+          # #checkov:skip comments next to the resource, each with a reason.
           skip_check: >-
             CKV_AWS_130,
             CKV2_AWS_12
 
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         if: always()
         with:
           sarif_file: checkov-results.sarif
+          category: checkov
 
-  # ─── Stage 7: Build & Push to ECR ────────────────────────────────────────
+  # ─── Stage 8: Build & Push to ECR ────────────────────────────────────────
   build-push:
     name: Build & Push (ECR)
     runs-on: ubuntu-latest
-    needs: [sast, test, iac-scan]
+    needs: [sast, test, regression, iac-scan]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     permissions:
       contents: read
@@ -208,12 +314,18 @@ jobs:
     outputs:
       image-tag: ${{ steps.meta.outputs.tags }}
       image-digest: ${{ steps.build.outputs.digest }}
-      ecr-image: ${{ steps.build-push.outputs.ecr-image }}
+      ecr-image: ${{ steps.build.outputs.ecr-image }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compute build version
+        id: version
+        run: echo "app-version=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials (OIDC — no long-lived keys)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -221,14 +333,14 @@ jobs:
 
       - name: Login to Amazon ECR
         id: ecr-login
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Extract image metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}
           tags: |
@@ -237,13 +349,15 @@ jobs:
 
       - name: Build and push image
         id: build-push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: app/
           file: app/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Same build arg the regression job tested with; /info reports it.
+          build-args: APP_VERSION=${{ steps.version.outputs.app-version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: true
@@ -251,13 +365,16 @@ jobs:
 
       - name: Output image reference
         id: build
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          DIGEST: ${{ steps.build-push.outputs.digest }}
         run: |
-          IMAGE="${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}@${{ steps.build-push.outputs.digest }}"
+          IMAGE="${REGISTRY}/${ECR_REPOSITORY}@${DIGEST}"
           echo "ecr-image=${IMAGE}" >> "$GITHUB_OUTPUT"
-          echo "digest=${{ steps.build-push.outputs.digest }}" >> "$GITHUB_OUTPUT"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "Pushed: ${IMAGE}"
 
-  # ─── Stage 8: Keyless Image Signing (Cosign + Sigstore) ──────────────────
+  # ─── Stage 9: Keyless Image Signing (Cosign + Sigstore) ──────────────────
   sign:
     name: Sign Image (Cosign)
     runs-on: ubuntu-latest
@@ -265,42 +382,36 @@ jobs:
     permissions:
       contents: read
       id-token: write       # OIDC token for Sigstore Fulcio CA
-      packages: write
     steps:
-      - uses: actions/checkout@v4
-
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
 
       - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
         with:
-          # Pinned to 2.6.4 (latest 2.x) instead of the action's default
-          # "latest", which would otherwise resolve to whatever Cosign ships
-          # next — including v3 once it stabilizes. Cosign v3 mostly changes
-          # defaults (bundle format, Rekor v2), not the keyless signing flow
-          # used here; re-verify `cosign verify` against this pin after a
-          # deliberate bump, not silently on the next run.
-          cosign-release: "v2.6.4"
+          # Pinned to the newest 2.x (upstream supports only the last 2.x
+          # release) instead of the action's default "latest", which would
+          # silently jump to v3. v3 changes defaults (bundle format, Rekor v2),
+          # so re-check `cosign verify` after a deliberate major bump.
+          cosign-release: "v2.6.5"
 
       - name: Sign the image (keyless — identity bound to this workflow)
         env:
-          COSIGN_EXPERIMENTAL: "1"
+          IMAGE: ${{ needs.build-push.outputs.ecr-image }}
         run: |
-          cosign sign --yes \
-            "${{ needs.build-push.outputs.ecr-image }}"
+          cosign sign --yes "${IMAGE}"
           echo "Image signed. Verify with:"
-          echo "  cosign verify ${{ needs.build-push.outputs.ecr-image }} \\"
+          echo "  cosign verify ${IMAGE} \\"
           echo "    --certificate-identity-regexp 'https://github.com/Oseguera12/eks-gitops' \\"
           echo "    --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'"
 
-  # ─── Stage 9: Container Image Scan + SBOM ────────────────────────────────
+  # ─── Stage 10: Container Image Scan + SBOM ───────────────────────────────
   scan-image:
     name: Image Scan (Trivy) + SBOM (Syft)
     runs-on: ubuntu-latest
@@ -310,19 +421,21 @@ jobs:
       security-events: write
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
 
       - name: Trivy — full image vulnerability scan
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ needs.build-push.outputs.ecr-image }}
           format: sarif
@@ -330,46 +443,56 @@ jobs:
           severity: CRITICAL,HIGH
           exit-code: "1"   # Fail the build on any CRITICAL or HIGH CVE
 
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         if: always()
         with:
           sarif_file: trivy-results.sarif
+          category: trivy
 
       - name: Syft — generate SBOM
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ${{ needs.build-push.outputs.ecr-image }}
           format: spdx-json
           artifact-name: sbom.spdx.json
 
-  # ─── Stage 10: Deploy via GitOps ─────────────────────────────────────────
+  # ─── Stage 11: Deploy via GitOps ─────────────────────────────────────────
   deploy:
     name: Deploy (ArgoCD GitOps)
     runs-on: ubuntu-latest
-    needs: [sign, scan-image]
+    # build-push must be listed directly: `needs.<job>.outputs` only resolves
+    # for direct dependencies, so omitting it makes DIGEST an empty string.
+    needs: [build-push, sign, scan-image]
+    # The canary alone is ~15 min (5m pause, 5m analysis, 5m pause).
+    timeout-minutes: 40
     permissions:
-      contents: write  # Write back the updated image tag to Git
+      contents: write  # Write back the updated image digest to Git
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      # Credentials persist on purpose: this job pushes the digest commit.
+      # It uploads no artifacts.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true  # zizmor: ignore[artipacked]
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: ecr-login
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
 
-      - name: Update image tag in Rollout manifest
+      - name: Update image digest in Rollout manifest
+        id: pin
         env:
           DIGEST: ${{ needs.build-push.outputs.image-digest }}
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         run: |
+          [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "invalid image digest: '${DIGEST}'"; exit 1; }
           # Replace the image reference in the Kustomize base with the
           # immutable digest. Using digest (not tag) ensures ArgoCD deploys
           # exactly the signed, scanned image — not a tag that could be
@@ -377,66 +500,72 @@ jobs:
           # so this always flows straight through to workloads-staging;
           # promoting it to prod is a separate, manual step — see
           # .github/workflows/promote-to-prod.yml.
-          IMAGE="${REGISTRY}/${{ env.ECR_REPOSITORY }}@${DIGEST}"
+          IMAGE="${REGISTRY}/${ECR_REPOSITORY}@${DIGEST}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
           sed -i "s|image:.*platform-status.*|image: ${IMAGE}|g" \
             kubernetes/workloads/platform-status/base/rollout.yaml
+
+          # A cached rebuild can reproduce the same digest; that's a no-op, not a failure.
+          if git diff --quiet -- kubernetes/workloads/platform-status/base/rollout.yaml; then
+            echo "Staging already runs ${DIGEST:0:19}; nothing to commit."
+            exit 0
+          fi
 
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add kubernetes/workloads/platform-status/base/rollout.yaml
-          git commit -m "chore(deploy): update platform-status to ${DIGEST:0:12} [skip ci]"
+          git commit -m "chore(deploy): update platform-status to ${DIGEST:0:19} [skip ci]"
           git push
 
-      - name: Wait for ArgoCD sync
-        env:
-          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
-          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+      - name: Install kubectl (pinned, checksum-verified)
         run: |
-          # Install ArgoCD CLI
-          curl -sSL -o argocd \
-            "https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64"
-          chmod +x argocd
+          base="https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64"
+          curl -fsSLO "${base}/kubectl"
+          echo "$(curl -fsSL "${base}/kubectl.sha256")  kubectl" | sha256sum --check --strict -
+          sudo install -m 0755 kubectl /usr/local/bin/kubectl
 
-          # Trigger sync and wait for healthy status — staging only. Prod
-          # (the `workloads` Application) is never synced from CI.
-          ./argocd app sync workloads-staging \
-            --server "${ARGOCD_SERVER}" \
-            --auth-token "${ARGOCD_AUTH_TOKEN}" \
-            --grpc-web \
-            --timeout 300
+      - name: Point kubectl at the cluster
+        run: aws eks update-kubeconfig --region "${AWS_REGION}" --name "${CLUSTER_NAME}"
 
-          ./argocd app wait workloads-staging \
-            --server "${ARGOCD_SERVER}" \
-            --auth-token "${ARGOCD_AUTH_TOKEN}" \
-            --grpc-web \
-            --health \
-            --timeout 300
+      # Argo CD (not this job) applies the change. Going through the
+      # Kubernetes API means no Argo CD endpoint or token is exposed to CI;
+      # the job only confirms the canary actually completed in staging.
+      - name: Wait for the staging canary to complete
+        id: rollout
+        env:
+          IMAGE: ${{ steps.pin.outputs.image }}
+        run: |
+          kubectl -n argocd annotate application workloads-staging \
+            argocd.argoproj.io/refresh=normal --overwrite
+          scripts/wait-for-rollout.sh platform-status-staging platform-status "${IMAGE}"
 
-          echo "Deployment complete. ArgoCD synced workloads-staging application."
+      - name: Deployment summary
+        env:
+          IMAGE: ${{ steps.pin.outputs.image }}
+          ROLLOUT_SECONDS: ${{ steps.rollout.outputs.rollout_seconds }}
+        run: |
+          {
+            echo "### Staging deploy"
+            echo "- Image: \`${IMAGE##*@}\`"
+            echo "- Commit to Healthy (canary incl. analysis): ${ROLLOUT_SECONDS}s"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ─── Pipeline Summary ─────────────────────────────────────────────────────
   pipeline-summary:
     name: Pipeline Summary
     runs-on: ubuntu-latest
-    needs: [secret-scan, sast, sca, lint, test, iac-scan, build-push, sign, scan-image, deploy]
+    needs: [secret-scan, sast, sca, lint, test, regression, iac-scan, build-push, sign, scan-image, deploy]
     if: always()
     permissions:
       contents: read
       actions: read  # gh api .../jobs, to read each stage's real duration
     steps:
       - name: Print pipeline outcome
+        env:
+          RESULTS: ${{ toJSON(needs) }}
         run: |
           echo "=== Pipeline Results ==="
-          echo "Secret Scan:  ${{ needs.secret-scan.result }}"
-          echo "SAST:         ${{ needs.sast.result }}"
-          echo "SCA:          ${{ needs.sca.result }}"
-          echo "Lint:         ${{ needs.lint.result }}"
-          echo "Tests:        ${{ needs.test.result }}"
-          echo "IaC Scan:     ${{ needs.iac-scan.result }}"
-          echo "Build/Push:   ${{ needs.build-push.result }}"
-          echo "Sign:         ${{ needs.sign.result }}"
-          echo "Image Scan:   ${{ needs.scan-image.result }}"
-          echo "Deploy:       ${{ needs.deploy.result }}"
+          echo "${RESULTS}" | jq -r 'to_entries[] | "\(.key | . + ":" | .[0:14]) \(.value.result)"'
 
       # Feeds the "gate durations" field in metrics/runtime-metrics.json — see
       # the "Runtime Metrics" workflow, which downloads this artifact and
@@ -446,7 +575,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" --paginate \
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs" --paginate \
             --jq '.jobs[] | select(.name != "Pipeline Summary") | {name, conclusion, started_at, completed_at}' \
             | python3 -c '
           import sys, json, datetime
@@ -470,7 +599,7 @@ jobs:
           print(f"wrote {len(gates)} gate entries to gates.json")
           '
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pipeline-gates
           path: gates.json
