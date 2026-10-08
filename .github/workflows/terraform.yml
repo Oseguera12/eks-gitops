@@ -38,16 +38,18 @@ jobs:
       run:
         working-directory: terraform/
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: Terraform-${{ github.run_id }}
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
@@ -67,18 +69,21 @@ jobs:
       # No -var-file here: terraform.tfvars is gitignored and never exists on a
       # CI runner. variables.tf defaults mirror terraform.tfvars.example, so
       # the defaults ARE the intended CI config.
+      # Actions' default bash runs with -o pipefail, so a failed plan fails this
+      # step despite the tee. continue-on-error lets the PR still get the
+      # (failed) plan as a comment; "Fail if plan failed" below turns the job red.
+      # Values marked `sensitive` are redacted by Terraform in plan.txt.
       - name: Terraform Plan
         id: plan
         run: |
           terraform plan \
             -out=tfplan \
             -no-color 2>&1 | tee plan.txt
-          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
         continue-on-error: true
 
       - name: Post plan to PR
         if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const fs = require('fs');
@@ -93,6 +98,10 @@ jobs:
               repo: context.repo.repo,
               body: output,
             });
+
+      - name: Fail if plan failed
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
 
       - name: Terraform Apply
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'

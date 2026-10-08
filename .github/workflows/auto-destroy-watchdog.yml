@@ -30,12 +30,14 @@ jobs:
     name: Check cluster age
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Configure AWS credentials (OIDC)
         id: aws-auth
         continue-on-error: true # role may not exist yet on a from-scratch repo — treat as "no cluster"
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -45,6 +47,8 @@ jobs:
         id: check
         if: steps.aws-auth.outcome == 'success'
         run: |
+          # describe-cluster exits non-zero when the cluster doesn't exist;
+          # that's the normal "nothing to do" case, not an error.
           created_at=$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" \
             --query 'cluster.createdAt' --output text 2>/dev/null || true)
 

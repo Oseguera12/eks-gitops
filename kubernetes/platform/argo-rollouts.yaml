@@ -8,7 +8,9 @@ metadata:
   name: argo-rollouts
   namespace: argocd
   annotations:
-    argocd.argoproj.io/sync-wave: "2"
+    # Wave 3: the chart's ServiceMonitor needs the CRD from
+    # prometheus-stack (wave 2).
+    argocd.argoproj.io/sync-wave: "3"
 spec:
   project: default
   source:
@@ -31,6 +33,15 @@ spec:
             enabled: true
             serviceMonitor:
               enabled: true
+          # rollout.yaml routes canary traffic through this plugin; without it
+          # the controller logs "plugin not configured" and every canary
+          # stalls at its first setWeight. The binary is downloaded at
+          # controller start and checked against sha256. linux-amd64 matches
+          # the t3.medium node group — use the -arm64 asset for Graviton.
+          trafficRouterPlugins:
+            - name: argoproj-labs/gatewayAPI
+              location: https://github.com/argoproj-labs/rollouts-plugin-trafficrouter-gatewayapi/releases/download/v0.17.0/gatewayapi-plugin-linux-amd64
+              sha256: 1904ca787d33107c140521899d61fff030ee75d99908bd175fca5a4647759061
         dashboard:
           enabled: true
           replicas: 1

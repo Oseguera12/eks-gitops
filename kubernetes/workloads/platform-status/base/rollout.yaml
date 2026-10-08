@@ -26,11 +26,10 @@ spec:
   template:
     metadata:
       labels:
+        # podmonitor.yaml selects on this label and sets the port/path itself,
+        # so no prometheus.io/* hints are needed (as labels they'd be invalid:
+        # "/metrics" isn't a legal label value and the Rollout goes InvalidSpec).
         app: platform-status
-        # Prometheus scraping via PodMonitor
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "8080"
-        prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: platform-status
       securityContext:
@@ -53,10 +52,8 @@ spec:
               value: "prod"
             - name: CLUSTER_NAME
               value: "eks-gitops"
-            - name: APP_VERSION
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.labels['app.kubernetes.io/version']
+            # APP_VERSION is baked into the image at build time (Dockerfile
+            # ARG), not set here — a pod-spec value would override it.
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:

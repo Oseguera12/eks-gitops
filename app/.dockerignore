@@ -1,0 +1,6 @@
+# Allowlist: the image only needs these. Everything else (tests, e2e results,
+# local .env files, caches) stays out of the build context.
+*
+!requirements.txt
+!src/
+**/__pycache__

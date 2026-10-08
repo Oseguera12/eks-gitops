@@ -1,4 +1,5 @@
 resource "aws_ecr_repository" "this" {
+  #checkov:skip=CKV_AWS_136:Images are AES256-encrypted at rest and contain no secrets; switching encryption_type forces repository replacement.
   name                 = var.repository_name
   image_tag_mutability = "IMMUTABLE" # Prevents tag overwriting — critical for supply chain integrity
 
@@ -20,10 +21,10 @@ resource "aws_ecr_lifecycle_policy" "this" {
         rulePriority = 1
         description  = "Retain the last ${var.image_count_policy} tagged images"
         selection = {
-          tagStatus   = "tagged"
+          tagStatus     = "tagged"
           tagPrefixList = ["v", "sha-"]
-          countType   = "imageCountMoreThan"
-          countNumber = var.image_count_policy
+          countType     = "imageCountMoreThan"
+          countNumber   = var.image_count_policy
         }
         action = { type = "expire" }
       },

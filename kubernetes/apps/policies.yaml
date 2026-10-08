@@ -26,6 +26,12 @@ spec:
     repoURL: https://github.com/Oseguera12/eks-gitops.git
     targetRevision: main
     path: policies/gatekeeper
+    # Templates and constraints live in subdirectories, which Argo CD skips
+    # unless recurse is set. include keeps fixtures/ (intentionally-bad pods
+    # used by run-fixtures.sh) and the script itself off the cluster.
+    directory:
+      recurse: true
+      include: "{templates/*.yaml,constraints/*.yaml,podmonitor.yaml}"
   destination:
     server: https://kubernetes.default.svc
     namespace: gatekeeper-system
@@ -38,6 +44,13 @@ spec:
       # ConstraintTemplates and Constraints are cluster-scoped CRDs;
       # server-side apply handles field ownership correctly.
       - ServerSideApply=true
-      # Do not fail the sync if Gatekeeper CRDs are not yet registered;
-      # ArgoCD will retry until the CRDs are available.
+      # Constraint kinds (K8sRequiredNonRoot, ...) are CRDs Gatekeeper
+      # generates from the templates a few seconds after they're applied.
+      # Skip the dry-run for not-yet-registered kinds, and retry the apply.
       - SkipDryRunOnMissingResource=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m

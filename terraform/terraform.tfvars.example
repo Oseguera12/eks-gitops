@@ -6,7 +6,7 @@ cluster_name = "eks-gitops"
 environment  = "prod"
 
 # Kubernetes version — check for latest EKS-supported version before deploying
-cluster_version = "1.32"
+cluster_version = "1.35"
 
 # VPC — defaults work for most cases; adjust only if CIDR conflicts exist
 vpc_cidr             = "10.0.0.0/16"

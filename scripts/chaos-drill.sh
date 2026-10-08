@@ -92,7 +92,7 @@ if [ "${RUN_NODE_DRAIN}" = "1" ]; then
     echo "[chaos] node-drain: waiting up to ${NODE_DRAIN_TIMEOUT_SECONDS}s for Cluster Autoscaler to replace it and all pods to be Ready..."
     deadline=$((t_drain + NODE_DRAIN_TIMEOUT_SECONDS))
     while [ "$(date +%s)" -lt "${deadline}" ]; do
-      not_ready=$(kubectl get pods -A --no-headers 2>/dev/null | grep -Ev ' (Running|Completed|Succeeded) ' | wc -l | tr -d ' ')
+      not_ready=$(kubectl get pods -A --no-headers 2>/dev/null | grep -Evc ' (Running|Completed|Succeeded) ')
       node_count=$(kubectl get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')
       if [ "${not_ready}" -eq 0 ] && [ "${node_count}" -ge 2 ]; then
         node_drain_recovery_seconds=$(($(date +%s) - t_drain))

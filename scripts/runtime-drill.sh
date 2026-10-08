@@ -138,7 +138,6 @@ else
   mttd_seconds="null"
 fi
 
-t_cleanup_start=$(date +%s)
 cleanup
 trap - EXIT
 t_cleanup_end=$(date +%s)

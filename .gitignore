@@ -79,6 +79,10 @@ trivy-results.json
 # CI is the system of record — it uploads this as a pipeline artifact, it
 # doesn't need to be committed. Local drill runs shouldn't leave it dirty.
 metrics/runtime-metrics.json
+metrics/regression-metrics.json
+
+# ─── Playwright regression output (scripts/run-regression.sh) ─────────────────
+app/e2e/test-results/
 
 # ─── Local verification evidence (scripts/verify.sh) ──────────────────────────
 # Personal record for interview/resume prep — not meant for the repo.

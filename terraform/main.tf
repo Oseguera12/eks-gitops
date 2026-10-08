@@ -6,6 +6,14 @@
 #   independently without affecting the other layers. This mirrors how
 #   platform teams structure Terraform at scale.
 
+data "aws_caller_identity" "current" {}
+
+locals {
+  # Must match the names bootstrap/setup.sh creates.
+  tf_state_bucket_arn = "arn:aws:s3:::eks-gitops-tfstate-${data.aws_caller_identity.current.account_id}"
+  tf_lock_table_arn   = "arn:aws:dynamodb:${var.aws_region}:${data.aws_caller_identity.current.account_id}:table/eks-gitops-tfstate-lock"
+}
+
 # ─── Networking ───────────────────────────────────────────────────────────────
 
 module "vpc" {
@@ -65,9 +73,9 @@ module "iam_github_oidc" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "ECRAuth"
-        Effect = "Allow"
-        Action = ["ecr:GetAuthorizationToken"]
+        Sid      = "ECRAuth"
+        Effect   = "Allow"
+        Action   = ["ecr:GetAuthorizationToken"]
         Resource = ["*"]
       },
       {
@@ -94,15 +102,20 @@ module "iam_github_oidc" {
         Resource = [module.eks.cluster_arn]
       },
       {
-        Sid    = "TerraformState"
+        Sid      = "TerraformStateList"
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = [local.tf_state_bucket_arn]
+      },
+      {
+        Sid    = "TerraformStateObjects"
         Effect = "Allow"
         Action = [
           "s3:GetObject",
           "s3:PutObject",
           "s3:DeleteObject",
-          "s3:ListBucket",
         ]
-        Resource = ["*"]  # Scoped to state bucket at bootstrap time
+        Resource = ["${local.tf_state_bucket_arn}/eks-gitops/*"]
       },
       {
         Sid    = "TerraformLock"
@@ -112,7 +125,7 @@ module "iam_github_oidc" {
           "dynamodb:PutItem",
           "dynamodb:DeleteItem",
         ]
-        Resource = ["*"]  # Scoped to lock table at bootstrap time
+        Resource = [local.tf_lock_table_arn]
       },
     ]
   })
@@ -144,7 +157,7 @@ module "iam_external_secrets" {
           "secretsmanager:DescribeSecret",
           "secretsmanager:ListSecretVersionIds",
         ]
-        Resource = ["arn:aws:secretsmanager:${var.aws_region}:*:secret:eks-gitops/*"]
+        Resource = ["arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:eks-gitops/*"]
       },
     ]
   })

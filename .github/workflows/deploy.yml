@@ -10,12 +10,10 @@ name: Deploy — Full Stack (Manual)
 # fixed suffixes), so they survive a destroy → this workflow cycle unchanged
 # — no re-substitution needed.
 #
-# Does NOT refresh ARGOCD_SERVER / ARGOCD_AUTH_TOKEN. Those point at the
-# ArgoCD instance's admin account and LoadBalancer hostname, both of which
-# are recreated from scratch here. If you want ci-cd.yml's `argocd app sync`
-# deploy stage to work this session (i.e. you're pushing new app code, not
-# just checking the platform comes up clean), regenerate and update those
-# two secrets using the values this workflow prints in its summary.
+# Argo CD stays ClusterIP-only and CI never holds an Argo CD credential:
+# ci-cd.yml's deploy job and promote-to-prod.yml watch rollouts through the
+# Kubernetes API with this same OIDC role. The job summary is public (this
+# repo is public), so it never contains the admin password — read it locally.
 
 on:
   workflow_dispatch:
@@ -33,7 +31,7 @@ env:
   AWS_REGION: us-east-1
   CLUSTER_NAME: eks-gitops
   TF_VERSION: "1.15.7"
-  ARGOCD_CHART_VERSION: "7.8.28"
+  ARGOCD_CHART_VERSION: "10.10.0"  # Argo CD v3.5.4; keep in sync with README Step 7
 
 jobs:
   deploy:
@@ -41,16 +39,18 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event.inputs.confirm == 'DEPLOY'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: GitHubActions-Deploy-${{ github.run_id }}
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
@@ -114,24 +114,18 @@ jobs:
           kubectl get applications -n argocd >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-          ARGOCD_PW=$(kubectl -n argocd get secret argocd-initial-admin-secret \
-            -o jsonpath="{.data.password}" 2>/dev/null | base64 -d || echo "<unavailable>")
-          ARGOCD_LB=$(kubectl get svc argocd-server -n argocd \
-            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "<pending — LB DNS can take a couple minutes>")
           # NGINX Gateway Fabric names the per-Gateway LB service <gateway-name>-nginx.
           GATEWAY_LB=$(kubectl get svc eks-gitops-nginx -n nginx-gateway \
             -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "<pending — LB DNS can take a couple minutes>")
 
           {
             echo ""
-            echo "### ArgoCD access (fresh this session — LB and admin account are new)"
-            echo "- Server: \`${ARGOCD_LB}\`"
-            echo "- Username: \`admin\`"
-            echo "- Password: \`${ARGOCD_PW}\`"
-            echo ""
-            echo "If you plan to push app code and want ci-cd.yml's deploy stage to work,"
-            echo "update the \`ARGOCD_SERVER\` and \`ARGOCD_AUTH_TOKEN\` repo secrets with"
-            echo "these values (generate the token with \`argocd account generate-token\`)."
+            echo "### ArgoCD access (local only — new admin account this session)"
+            echo "\`\`\`bash"
+            echo "aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}"
+            echo "kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d"
+            echo "kubectl -n argocd port-forward svc/argocd-server 8080:80   # http://localhost:8080, user admin"
+            echo "\`\`\`"
             echo ""
             echo "### Gateway (for canary traffic during a rollout demo)"
             echo "- Hostname: \`${GATEWAY_LB}\`"

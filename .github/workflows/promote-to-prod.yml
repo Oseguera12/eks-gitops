@@ -17,33 +17,59 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: write   # push the promotion commit
+  id-token: write   # AWS OIDC, to watch the prod rollout through the Kubernetes API
+
+concurrency:
+  group: promote-to-prod
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: eks-gitops
+  KUBECTL_VERSION: v1.35.9  # within one minor of the cluster
 
 jobs:
   promote:
     name: Promote staging image to prod
     runs-on: ubuntu-latest
-    if: github.event.inputs.confirm == 'PROMOTE'
+    if: inputs.confirm == 'PROMOTE'
+    timeout-minutes: 40   # the canary alone is ~15 min
     steps:
-      - uses: actions/checkout@v4
+      # Credentials persist on purpose: this job pushes the promotion commit.
+      # It uploads no artifacts.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true  # zizmor: ignore[artipacked]
 
       - name: Copy staging's current image into the prod overlay patch
+        id: pin
         run: |
           BASE_FILE="kubernetes/workloads/platform-status/base/rollout.yaml"
           PROD_PATCH="kubernetes/workloads/platform-status/overlays/prod/image-pin.yaml"
 
           IMAGE=$(grep -m1 '^\s*image:' "${BASE_FILE}" | sed 's/^\s*image:\s*//')
-          if [ -z "${IMAGE}" ]; then
-            echo "Could not read an image reference out of ${BASE_FILE}" >&2
+          # Only digest-pinned references are promotable; a tag or the
+          # pre-first-deploy placeholder must never reach prod.
+          if [[ ! "${IMAGE}" =~ ^[a-z0-9.-]+/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]; then
+            echo "Refusing to promote non-digest image reference: '${IMAGE}'" >&2
             exit 1
           fi
           echo "Promoting image: ${IMAGE}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
 
+          # The patch has exactly one `value:` (the image op); the grep below
+          # catches a silent no-match if its indentation ever changes.
           sed -i "s|^  value:.*|  value: ${IMAGE}|" "${PROD_PATCH}"
           grep -q "value: ${IMAGE}" "${PROD_PATCH}" || {
             echo "Patch substitution did not land in ${PROD_PATCH}" >&2
             exit 1
           }
+
+          if git diff --quiet -- "${PROD_PATCH}"; then
+            echo "Prod is already pinned to ${IMAGE}; nothing to commit." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
 
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -51,27 +77,40 @@ jobs:
           git commit -m "chore(promote): prod -> ${IMAGE##*[@:]}"
           git push
 
-      - name: Sync prod via ArgoCD
-        env:
-          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
-          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-Promote-${{ github.run_id }}
+
+      - name: Install kubectl (pinned, checksum-verified)
         run: |
-          curl -sSL -o argocd \
-            "https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64"
-          chmod +x argocd
+          base="https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64"
+          curl -fsSLO "${base}/kubectl"
+          echo "$(curl -fsSL "${base}/kubectl.sha256")  kubectl" | sha256sum --check --strict -
+          sudo install -m 0755 kubectl /usr/local/bin/kubectl
 
-          ./argocd app sync workloads \
-            --server "${ARGOCD_SERVER}" \
-            --auth-token "${ARGOCD_AUTH_TOKEN}" \
-            --grpc-web \
-            --timeout 300
+      - name: Point kubectl at the cluster
+        run: aws eks update-kubeconfig --region "${AWS_REGION}" --name "${CLUSTER_NAME}"
 
-          ./argocd app wait workloads \
-            --server "${ARGOCD_SERVER}" \
-            --auth-token "${ARGOCD_AUTH_TOKEN}" \
-            --grpc-web \
-            --health \
-            --timeout 300
+      # Argo CD applies the commit; this only confirms the prod canary finished.
+      - name: Wait for the prod canary to complete
+        id: rollout
+        env:
+          IMAGE: ${{ steps.pin.outputs.image }}
+        run: |
+          kubectl -n argocd annotate application workloads \
+            argocd.argoproj.io/refresh=normal --overwrite
+          scripts/wait-for-rollout.sh platform-status platform-status "${IMAGE}"
 
-          echo "Promotion complete. Prod (workloads Application) is now running staging's image." \
-            >> "$GITHUB_STEP_SUMMARY"
+      - name: Promotion summary
+        env:
+          IMAGE: ${{ steps.pin.outputs.image }}
+          ROLLOUT_SECONDS: ${{ steps.rollout.outputs.rollout_seconds }}
+        run: |
+          {
+            echo "### Promoted to prod"
+            echo "- Image: \`${IMAGE##*@}\`"
+            echo "- Commit to Healthy (canary incl. analysis): ${ROLLOUT_SECONDS}s"
+          } >> "$GITHUB_STEP_SUMMARY"

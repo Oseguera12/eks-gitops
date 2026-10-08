@@ -13,12 +13,11 @@ spec:
   source:
     repoURL: https://open-policy-agent.github.io/gatekeeper/charts
     chart: gatekeeper
-    # Pinned to 3.23.0 (latest stable at time of pinning) instead of a floating
-    # "3.17.*". Gatekeeper 3.18 made the `generate` operation required for CRD
+    # Exact pin (3.23.1, latest patch) instead of a floating range. Gatekeeper 3.18 made the `generate` operation required for CRD
     # and ValidatingAdmissionPolicy generation — gatekeeper-audit must run with
     # --operation=generate, which the chart already sets by default from 3.18
     # onward. Reviewed: no custom operation flags are overridden in this stack.
-    targetRevision: "3.23.0"
+    targetRevision: "3.23.1"
     helm:
       releaseName: gatekeeper
       values: |

@@ -64,8 +64,8 @@ terraform -chdir=terraform apply -var-file=terraform.tfvars
 # Step 5: Configure GitHub Actions secrets (AWS_ROLE_ARN, TF_STATE_*)
 # Step 6: Substitute Terraform outputs into platform manifests + push
 # Step 7: Bootstrap ArgoCD (Helm install + root app-of-apps)
-# Step 8: Configure GitHub Actions secrets (ARGOCD_SERVER, ARGOCD_AUTH_TOKEN)
-# Step 9: Push to main — GitHub Actions runs all 10 pipeline stages
+# Step 8: (optional) Open the ArgoCD UI locally — CI needs no ArgoCD credentials
+# Step 9: Push to main — GitHub Actions runs all 11 pipeline stages
 ```
 
 See [Initial Setup](#initial-setup) for the complete ordered walkthrough — one-time only. For every session after that, use the [Demo Session Runbook](#demo-session-runbook) instead.
@@ -101,7 +101,7 @@ For every subsequent session — spin the whole stack up, confirm it works, reco
 
 ## Executive Summary
 
-This project provisions a production-grade Kubernetes platform on AWS EKS using Terraform, manages all application delivery through ArgoCD GitOps, and enforces a 10-stage DevSecOps CI/CD pipeline that gates every image on secrets scanning, SAST, dependency CVEs, Dockerfile linting, unit tests, IaC scanning, image signing, vulnerability scanning, and SBOM generation — before a single byte is deployed.
+This project provisions a production-grade Kubernetes platform on AWS EKS using Terraform, manages all application delivery through ArgoCD GitOps, and enforces an 11-stage DevSecOps CI/CD pipeline that gates every image on secrets scanning, SAST, dependency CVEs, Dockerfile linting, unit tests, a Playwright regression suite against the hardened container, IaC scanning, image signing, vulnerability scanning, and SBOM generation — before a single byte is deployed.
 
 **What this demonstrates:**
 
@@ -109,7 +109,7 @@ This project provisions a production-grade Kubernetes platform on AWS EKS using 
 |---|---|
 | Cloud infrastructure (AWS) | EKS, VPC, ECR, Secrets Manager, IAM/IRSA — Terraform |
 | GitOps | ArgoCD app-of-apps, auto-sync, self-heal |
-| DevSecOps pipeline | 10-stage GitHub Actions with OIDC, Cosign, Trivy, Semgrep |
+| DevSecOps pipeline | 11-stage GitHub Actions with OIDC, Cosign, Trivy, Semgrep, Playwright |
 | Supply chain security | Keyless image signing via Sigstore/Cosign, SBOM (Syft), immutable ECR tags |
 | Policy as code | OPA Gatekeeper constraints, offline Checkov IaC scan |
 | Progressive delivery | Argo Rollouts canary with Prometheus AnalysisTemplate |
@@ -125,7 +125,7 @@ The platform follows a strict GitOps model: **Git is the single source of truth*
 ```
 Developer → Git Push
     ↓
-GitHub Actions (10 stages)
+GitHub Actions (11 stages)
     ↓ OIDC (no long-lived keys)
 AWS ECR ← signed image + SBOM attestation
     ↓
@@ -228,10 +228,10 @@ graph TB
 
 | Layer | Technology | Version | Purpose |
 |---|---|---|---|
-| Cloud | AWS EKS | 1.32 | Managed Kubernetes control plane |
+| Cloud | AWS EKS | 1.35 | Managed Kubernetes control plane |
 | IaC | Terraform | 1.9.x | Infrastructure provisioning |
 | GitOps | ArgoCD | 2.14.x | Continuous delivery, app-of-apps |
-| CI/CD | GitHub Actions | — | 10-stage DevSecOps pipeline |
+| CI/CD | GitHub Actions | — | 11-stage DevSecOps pipeline |
 | Registry | Amazon ECR | — | Immutable image storage |
 | Secrets | AWS Secrets Manager + ESO | — | Keyless secret injection via IRSA |
 | Auth | IAM OIDC / IRSA | — | Zero long-lived credentials |
@@ -241,12 +241,14 @@ graph TB
 | Delivery | Argo Rollouts | 2.41.x | Canary deployments |
 | Traffic Routing | Gateway API + NGINX Gateway Fabric | GW API standard channel; NGF 2.6.x | Weighted canary traffic split (ingress-nginx's designated successor — see [Progressive Delivery](#progressive-delivery)) |
 | Traffic Routing Plugin | Argo Rollouts Gateway API plugin | 0.16.x | Adjusts HTTPRoute backendRef weights per canary step |
-| Config Management | Kustomize | (bundled with kubectl 1.32) | base/overlay structure for the staging/prod environment split |
+| Config Management | Kustomize | (bundled with kubectl 1.35) | base/overlay structure for the staging/prod environment split |
 | Signing | Cosign (keyless) | 2.x | Supply chain integrity via Sigstore |
 | SBOM | Syft | 1.x | Software bill of materials |
 | Scanning | Trivy | — | Container CVE scanning |
 | SAST | Semgrep | — | Static security analysis |
 | SCA | pip-audit | — | Dependency CVE audit |
+| Regression testing | Playwright (Python) + pytest | 1.63.x | Black-box API + Swagger UI suite against the hardened container, traced to a written test plan |
+| Dependency updates | Dependabot | — | Weekly PRs for Actions, pip, Docker, Terraform |
 | Linting | Hadolint + Ruff | — | Dockerfile + Python quality |
 | IaC Scan | Checkov | — | Terraform security posture |
 | Secret Scan | Gitleaks | — | Hardcoded credential detection |
@@ -289,7 +291,7 @@ Everything in this section happens **once**. After Step 11, every later session 
 |------|----------------|---------|
 | AWS CLI | 2.x | `brew install awscli` or [aws.amazon.com/cli](https://aws.amazon.com/cli/) |
 | Terraform | 1.15.7 (pinned) | `brew install terraform` or [tfenv](https://github.com/tfutils/tfenv) |
-| kubectl | 1.32+ | `brew install kubectl` |
+| kubectl | 1.35+ | `brew install kubectl` |
 | Helm | 3.16+ | `brew install helm` |
 | ArgoCD CLI | 2.14+ | `brew install argocd` |
 | GitHub CLI | 2.x | `brew install gh` then `gh auth login` |
@@ -464,8 +466,8 @@ printf "%s" "eks-gitops-tfstate-lock" | gh secret set TF_STATE_DYNAMODB_TABLE --
 | `AWS_ROLE_ARN` | `terraform output -raw github_actions_role_arn` | Secret |
 | `TF_STATE_BUCKET` | Step 3: `eks-gitops-tfstate-<AWS_ACCOUNT_ID>` | Secret |
 | `TF_STATE_DYNAMODB_TABLE` | `eks-gitops-tfstate-lock` | Secret |
-| `ARGOCD_SERVER` | Step 8 | Secret |
-| `ARGOCD_AUTH_TOKEN` | Step 8 | Secret — highest sensitivity |
+
+There are deliberately no Argo CD secrets. The `deploy` job and `promote-to-prod.yml` never call the Argo CD API: they commit the digest, request a refresh of the Application through the Kubernetes API (same OIDC role, `aws eks update-kubeconfig`), and wait on the Rollout with `scripts/wait-for-rollout.sh`. Argo CD stays `ClusterIP`-only.
 
 Optional secrets: `GITLEAKS_LICENSE` (only for the licensed Gitleaks action), `SEMGREP_APP_TOKEN` (enables Semgrep app rules/dashboard).
 
@@ -508,14 +510,14 @@ kubectl get nodes   # all nodes should be Ready
 helm repo add argo https://argoproj.github.io/argo-helm
 helm repo update
 
-# Pinned to chart 7.8.28 (ArgoCD app v2.14.11), not a floating "7.*" — chart
-# 8.x ships ArgoCD v3.0, a major version with its own migration guide:
-# https://argo-cd.readthedocs.io/en/stable/operator-manual/upgrading/2.14-3.0/
+# Exact pin (chart 10.10.0 = Argo CD v3.5.4), same as ARGOCD_CHART_VERSION in
+# .github/workflows/deploy.yml. Argo CD supports only its three newest minors;
+# bump deliberately and read the upgrade notes for each minor you cross.
 helm install argocd argo/argo-cd \
   --namespace argocd \
   --create-namespace \
   --values kubernetes/bootstrap/argocd/values.yaml \
-  --version "7.8.28" \
+  --version "10.10.0" \
   --wait --timeout 5m
 
 kubectl get pods -n argocd   # all should be Running
@@ -531,24 +533,20 @@ kubectl get applications -n argocd --watch
 
 ---
 
-### Step 8 — GitHub Actions Secrets (Round 2 — ArgoCD)
+### Step 8 — ArgoCD UI (optional, local only)
+
+CI needs nothing from this step. Argo CD has no public endpoint; reach it through a port-forward:
 
 ```bash
+kubectl -n argocd port-forward svc/argocd-server 8080:80 &
 ARGOCD_PW=$(kubectl -n argocd get secret argocd-initial-admin-secret \
   -o jsonpath="{.data.password}" | base64 -d)
-
-ARGOCD_SERVER=$(kubectl get svc argocd-server -n argocd \
-  -o jsonpath="{.status.loadBalancer.ingress[0].hostname}")
-
-argocd login "$ARGOCD_SERVER" --username admin --password "$ARGOCD_PW" --insecure
-
-ARGOCD_TOKEN=$(argocd account generate-token --account admin)
-
-printf "%s" "$ARGOCD_SERVER" | gh secret set ARGOCD_SERVER --repo Oseguera12/eks-gitops --body-file -
-printf "%s" "$ARGOCD_TOKEN" | gh secret set ARGOCD_AUTH_TOKEN --repo Oseguera12/eks-gitops --body-file -
-
-unset ARGOCD_PW ARGOCD_TOKEN
+argocd login localhost:8080 --username admin --password "$ARGOCD_PW" --plaintext --grpc-web
+unset ARGOCD_PW
+argocd app list
 ```
+
+Never paste this password into an issue, a commit, or a workflow summary — the repository and its Actions run pages are public.
 
 ---
 
@@ -559,7 +557,7 @@ git commit --allow-empty -m "chore: trigger initial CI/CD pipeline run"
 git push origin main
 ```
 
-Watch the run at `https://github.com/Oseguera12/eks-gitops/actions`. The `ci-cd.yml` workflow runs all 10 stages; its `deploy` stage builds and pushes the image to ECR (commit SHA tag), signs it with Cosign, attaches a Syft SBOM, updates `rollout.yaml` with the image digest, commits with `[skip ci]`, and runs `argocd app sync workloads --wait`.
+Watch the run at `https://github.com/Oseguera12/eks-gitops/actions`. The `ci-cd.yml` workflow runs all 11 stages; its `deploy` stage builds and pushes the image to ECR (commit SHA tag), signs it with Cosign, attaches a Syft SBOM, updates `rollout.yaml` with the image digest, commits with `[skip ci]`, requests an Argo CD refresh of `workloads-staging` through the Kubernetes API, and waits (`scripts/wait-for-rollout.sh`) until the staging Rollout runs that digest and finishes its canary — 20% → 5 min → success-rate analysis → 50% → 5 min → 100%, ~15 min — or fails if the analysis aborts it. The commit-to-Healthy time lands in the job summary. Prod only moves via `promote-to-prod.yml`, which waits the same way.
 
 ---
 
@@ -774,7 +772,7 @@ github_repo_owner = "Oseguera12"
 github_repo_name  = "eks-gitops"
 
 # Optional — override defaults
-cluster_version    = "1.32"
+cluster_version    = "1.35"
 node_instance_type = "t3.medium"
 node_min_size      = 1
 node_max_size      = 3
@@ -789,9 +787,7 @@ node_desired_size  = 2
 | `AWS_ACCOUNT_ID` | Bootstrap | Account ID for bucket naming |
 | `TF_STATE_BUCKET` | CI (Terraform backend) | S3 bucket name |
 | `TF_STATE_DYNAMODB_TABLE` | CI (Terraform backend) | DynamoDB lock table name |
-| `AWS_ROLE_ARN` | CI (GitHub Actions OIDC) | IAM role assumed per pipeline job |
-| `ARGOCD_SERVER` | CI (deploy stage) | ArgoCD API hostname |
-| `ARGOCD_AUTH_TOKEN` | CI (deploy stage) | ArgoCD API token |
+| `AWS_ROLE_ARN` | CI (GitHub Actions OIDC) | IAM role assumed per pipeline job (Terraform, ECR push, kubectl rollout wait) |
 
 ---
 
@@ -800,8 +796,9 @@ node_desired_size  = 2
 ```
 eks-gitops/
 ├── .github/
+│   ├── dependabot.yml        # Weekly update PRs: Actions (SHA pins), pip, Docker, Terraform
 │   └── workflows/
-│       ├── ci-cd.yml         # 10-stage DevSecOps pipeline (deploys to staging only)
+│       ├── ci-cd.yml         # 11-stage DevSecOps pipeline (deploys to staging only)
 │       ├── terraform.yml     # Infrastructure plan/apply (push, PR, or manual)
 │       ├── deploy.yml        # Manual: one-click terraform apply + ArgoCD bootstrap + wait-healthy
 │       ├── promote-to-prod.yml  # Manual: copy staging's current image to prod — the promotion gate
@@ -812,8 +809,18 @@ eks-gitops/
 │   ├── src/
 │   │   └── main.py           # FastAPI platform-status service
 │   ├── tests/
-│   │   └── test_main.py      # pytest unit tests
-│   ├── Dockerfile            # Multi-stage, non-root, HEALTHCHECK
+│   │   └── test_main.py      # pytest unit tests (in-process, TestClient)
+│   ├── e2e/                  # Playwright regression suite (black-box, against the built image)
+│   │   ├── MANUAL_TEST_PLAN.md       # TC-01..TC-15 — the source of truth tests are traced to
+│   │   ├── test-data/environments.json  # Per-environment expectations + latency budgets
+│   │   ├── conftest.py               # Traceability enforcement + results/latency capture
+│   │   ├── targets.py
+│   │   ├── test_api_regression.py    # TC-01..TC-13 (APIRequestContext)
+│   │   ├── test_docs_ui.py           # TC-14 (Chromium, Swagger UI)
+│   │   ├── pytest.ini
+│   │   └── requirements.txt
+│   ├── Dockerfile            # Multi-stage, non-root, HEALTHCHECK, version baked in at build
+│   ├── .dockerignore         # Allowlist: only requirements.txt + src/ enter the build context
 │   ├── requirements.txt      # Pinned production dependencies
 │   └── requirements-dev.txt  # Test/lint tooling
 ├── bootstrap/
@@ -869,9 +876,13 @@ eks-gitops/
 │   ├── chaos-drill.sh                # pod-kill + opt-in node-drain resilience drill (recovery seconds)
 │   ├── generate-canary-traffic.sh    # Synthetic load so the AnalysisTemplate has real data during a demo
 │   ├── emit-runtime-metrics.py       # Merges gates/admission/runtime/cost into metrics/runtime-metrics.json
+│   ├── run-regression.sh             # Starts the image hardened, waits on HEALTHCHECK, runs Playwright
+│   ├── summarize-regression.py       # Builds + schema-validates regression-metrics.json, writes job summary
+│   ├── wait-for-rollout.sh           # CI: waits for a Rollout to run a digest + reach Healthy (fails on Degraded)
 │   └── verify.sh                     # Live pass/fail checklist for a demo session — see Demo Session Runbook
 ├── metrics/
 │   ├── runtime-metrics.schema.json   # Shared schema — identical across all 4 portfolio projects
+│   ├── regression-metrics.schema.json  # Playwright regression bundle (eks-gitops + aks-pipeline)
 │   └── runtime-metrics.json          # Generated by CI/drills; gitignored, not committed
 ├── terraform/
 │   ├── modules/
@@ -902,22 +913,27 @@ push to main / PR
 │
 ├─ secret-scan ──────────────────────────────── Gitleaks (full history)
 │
-├─ sast ──────────────────────────────────────── Semgrep (p/python, p/docker, p/k8s)
-├─ sca ───────────────────────────────────────── pip-audit (CVE check)
+├─ sast ──────────────────────────────────────── Semgrep CLI (python, dockerfile, terraform, secrets, github-actions)
+├─ sca ───────────────────────────────────────── pip-audit (app, dev, and e2e requirements)
 ├─ lint ──────────────────────────────────────── Hadolint + Ruff
 ├─ iac-scan ──────────────────────────────────── Checkov (Terraform)
 │
-└─ test (needs: sca, lint)
+├─ test (needs: sca, lint) ───────────────────── pytest unit tests, ≥80% coverage gate
+├─ regression (needs: sca, lint) ─────────────── Playwright vs. the built image, run hardened
+│
+└─ build-push (needs: sast, test, regression, iac-scan) [main only]
    │
-   └─ build-push (needs: sast, test, iac-scan) [main only]
+   ├─ sign (Cosign keyless, Sigstore)
+   └─ scan-image (Trivy + Syft SBOM)
       │
-      ├─ sign (Cosign keyless, Sigstore)
-      └─ scan-image (Trivy + Syft SBOM)
-         │
-         └─ deploy (needs: sign, scan-image)
-            ├── Commit image digest to Git
-            └── ArgoCD sync + wait
+      └─ deploy (needs: build-push, sign, scan-image)
+         ├── Commit image digest to Git (staging)
+         └── ArgoCD sync + wait (workloads-staging)
+
+pipeline-summary (always) ─────────────────────── per-gate status + wall time → metrics bundle
 ```
+
+All third-party actions are pinned to a full commit SHA (tag in a trailing comment) and kept current by Dependabot. Checkouts drop the job token from `.git/config` (`persist-credentials: false`), except the two jobs that push a commit and upload nothing. Workflow inputs reach shell steps only through `env:`, never by inline `${{ }}` interpolation.
 
 **Security gates:** Every gate is a hard failure — the pipeline stops immediately if any stage exits non-zero. No `continue-on-error: true` on security stages.
 
@@ -927,6 +943,7 @@ push to main / PR
 | sast | Semgrep | SQL injection, path traversal, insecure deserialization |
 | sca | pip-audit | Known CVEs in Python dependencies |
 | lint | Hadolint | Dockerfile running as root, missing HEALTHCHECK |
+| regression | Playwright + pytest | Contract drift, wrong env/version wiring, CORS/method regressions, broken docs UI, latency over budget — in the exact image that will ship |
 | iac-scan | Checkov | Public S3 buckets, open security groups, unencrypted resources |
 | scan-image | Trivy | OS + library CVEs inside the container image (CRITICAL/HIGH block) |
 
@@ -945,7 +962,7 @@ Single NAT Gateway (cost optimization — see ADR). Internet Gateway for public 
 
 ### EKS
 
-- Kubernetes 1.32, managed control plane
+- Kubernetes 1.35 (standard support), managed control plane
 - Managed node group: 1–3 × t3.medium (Cluster Autoscaler manages desired count)
 - Addons: vpc-cni, kube-proxy, CoreDNS, aws-ebs-csi-driver (all AWS-managed, auto-patched)
 - OIDC provider for IRSA — all pod-level AWS access uses short-lived token exchange
@@ -980,6 +997,8 @@ Single NAT Gateway (cost optimization — see ADR). Internet Gateway for public 
 |---|---|
 | Zero long-lived credentials in CI | GitHub Actions OIDC → AWS IRSA |
 | Zero secrets stored in cluster | External Secrets Operator → AWS Secrets Manager |
+| Secrets encryption at rest | EKS envelope encryption of Kubernetes Secrets with a dedicated, auto-rotating KMS key |
+| Least-privilege CI role | Terraform state access scoped to this project's bucket prefix and lock table, not `*` |
 | Admission control | OPA Gatekeeper (non-root, resource limits, no privilege escalation) |
 | Runtime threat detection | Falco (eBPF, modern_ebpf driver) — shell-in-container, sensitive host mounts, writes below binary dirs; see [Runtime Detection & Metrics](#runtime-detection--metrics) |
 | Image immutability | ECR tag immutability enabled |
@@ -1171,7 +1190,15 @@ RUN_NODE_DRAIN=1 scripts/chaos-drill.sh /tmp/chaos-drill.json platform-status-st
 
 | Outcome | Value | Notes |
 |---|---|---|
-| Security gates per pipeline run | 7 distinct gates | secret, SAST, SCA, lint, IaC, image scan, sign |
+| Security/quality gates per pipeline run | 9 distinct gates | secret, SAST, SCA, lint, IaC, unit tests, Playwright regression, image scan, sign |
+| Regression test plan automated | 14 / 15 cases (93.3%) | `plan.automation_pct`; TC-15 (live canary split) is manual-only by design |
+| Regression pass rate | 14 / 14 (100%) | `results.pass_rate_pct` — local baseline; CI value in the `playwright-regression` artifact |
+| Regression suite duration | 3.5 s | `results.duration_seconds` — local baseline |
+| Container ready (hardened, start → HEALTHCHECK healthy) | 1.3 s | `container.ready_seconds` — read-only rootfs, UID 1001, all caps dropped |
+| Image size | 55.9 MB | `container.image_size_bytes` |
+| `/health` latency p50 / p95 | 2.0 ms / 8.2 ms | `latency_ms["/health"]` — CI budget is p95 < 100 ms, staging < 500 ms |
+| Fixable HIGH/CRITICAL image CVEs | 0 | Trivy, Debian 13.7 base |
+| Staging regression (live, via port-forward) | <!-- runtime-metrics.yml: playwright-staging gate --> | same suite, `E2E_ENV=staging` |
 | Long-lived credentials stored | 0 | OIDC + IRSA used throughout |
 | Manual deployment steps eliminated | <!-- count --> | |
 | Deployment frequency | <!-- count --> | commits/week → ArgoCD syncs |
@@ -1194,6 +1221,19 @@ python -m pytest tests/ -v --cov=src --cov-report=term-missing
 
 # Run a single test file
 python -m pytest tests/test_main.py -v
+
+# Playwright regression suite against the built image, started with the same
+# hardening as the cluster (read-only rootfs, non-root, no caps). Builds the
+# image, waits on its HEALTHCHECK, runs TC-01..TC-14, writes
+# app/e2e/test-results/regression-metrics.json (schema: metrics/regression-metrics.schema.json)
+python -m pip install -r app/e2e/requirements.txt
+python -m playwright install chromium
+scripts/run-regression.sh                                  # builds platform-status:regression first
+IMAGE=platform-status:regression scripts/run-regression.sh # or test an existing image
+
+# Same suite against any running instance (e.g. staging through a port-forward)
+kubectl -n platform-status-staging port-forward svc/platform-status-stable 18080:80 &
+cd app/e2e && E2E_ENV=staging E2E_BASE_URL=http://127.0.0.1:18080 python -m pytest
 
 # Run Gitleaks locally
 gitleaks detect --source . --verbose
@@ -1336,6 +1376,9 @@ cosign triangulate "${ECR_REPO}:<tag>"
 
 ## Future Improvements
 
+- [ ] VPC Flow Logs to CloudWatch (skipped today to keep the ephemeral demo cluster's cost and teardown simple — Checkov `CKV2_AWS_11` is skipped inline with that reason)
+- [ ] Move the Terraform backend from DynamoDB locking to S3-native `use_lockfile` (DynamoDB locking is deprecated as of Terraform 1.11)
+- [ ] Automate TC-15 (canary traffic split) as a staging-only Playwright case driven during a live rollout
 - [ ] AWS Load Balancer Controller for ALB-based ingress with WAF
 - [ ] Cert-manager + Let's Encrypt TLS for all endpoints
 - [ ] Vault external secrets backend (HashiCorp Vault on Proxmox homelab)

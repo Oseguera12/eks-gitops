@@ -1,0 +1,36 @@
+version: 2
+updates:
+  # Bumps the commit SHAs (and trailing version comments) on every `uses:`.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: pip
+    directory: /app
+    schedule:
+      interval: weekly
+    groups:
+      python:
+        patterns: ["*"]
+
+  - package-ecosystem: pip
+    directory: /app/e2e
+    schedule:
+      interval: weekly
+    groups:
+      playwright:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /app
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: terraform
+    directory: /terraform
+    schedule:
+      interval: weekly

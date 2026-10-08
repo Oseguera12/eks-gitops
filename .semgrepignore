@@ -1,0 +1,5 @@
+:include .gitignore
+
+# Intentionally insecure manifests — Gatekeeper must reject every one of
+# these (policies/gatekeeper/fixtures/run-fixtures.sh asserts it).
+policies/gatekeeper/fixtures/bad-workloads/
