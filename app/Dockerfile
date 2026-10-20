@@ -2,7 +2,7 @@
 
 # ─── Stage 1: dependency builder ──────────────────────────────────────────────
 # Isolated build stage keeps the final image free of build tooling.
-FROM python:3.12-slim AS builder
+FROM python:3.15-slim AS builder
 
 WORKDIR /build
 
@@ -13,7 +13,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 # ─── Stage 2: production image ────────────────────────────────────────────────
-FROM python:3.12-slim AS final
+FROM python:3.15-slim AS final
 
 # Build identity is baked into the image so it travels with the signed digest
 # through staging → prod promotion. /info and /status report it.
